@@ -1,61 +1,4 @@
-"""
-Drop the admissions whose sEHR input window and label window overlap.
-
-THE OVERLAP
------------
-Stage 4 selects sEHR codes at DAY granularity
-
-    hist_day <= discharge_day                     (forward_ehr)
-
-while the label window uses the exact timestamp
-
-    dischtime < code_time <= dischtime + N days   (build_admission_labels)
-
-so the hours between dischtime and midnight of the discharge day belong to
-both. A code landing there is simultaneously an encoder input and a label
-event. 42 of 3956 admissions contain 127 such codes.
-
-Only one of those codes is a target diagnosis: a single admission carries an
-I48 timestamped two minutes AFTER its own discharge, and it is the only I48
-in that admission's label window, so its AF label at every horizon comes from
-its own input. (Record identifiers are omitted here -- MIMIC is credentialed
-under a PhysioNet DUA and this repository redistributes none of it.) The remaining 126 are medications and procedures
-that no target definition matches today. They would matter the moment the
-disease definition changed, which is why the rule dropped here is structural
-("the two windows overlap") rather than "this code happened to be an I48".
-
-WHY DROPPING IS NOT FREE
-------------------------
-These 42 are not a random 1%. Their event rate runs 2-3.5x the cohort's, in the
-same direction across all twelve disease x horizon combinations:
-
-    AF__365      29.0%  vs 11.7%
-    HF__365      35.5%  vs 17.5%
-    eMACE__365   39.4%  vs 19.6%
-
-Coding that continues past the discharge timestamp plausibly marks a
-complicated discharge, and a complicated discharge tracks severity. Removing
-them therefore shifts the cohort slightly toward lower risk. The size is small
--- 13 of 636 eMACE__365 positives, 8 of 2186 both-modality admissions -- but
-the direction is known and belongs in the limitations rather than in a
-footnote.
-
-The alternative was to make forward_ehr's window exact and re-extract the sEHR
-embeddings, which removes the overlap at its source and introduces no
-selection. That was not taken here on cost grounds; this file records what was
-traded for it.
-
-WHAT IT WRITES
---------------
-Filtered copies of all three artefacts, suffixed _clean, keyed identically on
-(dataset, patient_id, hadm_id). Leaving one unfiltered would silently
-misalign every downstream join, so the script verifies the three key sets are
-equal before writing anything.
-
-Usage:
-    python drop_overlapping_admissions.py
-    python drop_overlapping_admissions.py --dry-run
-"""
+"""Drop the admissions whose sEHR input window and label window overlap."""
 import os
 import sys
 
@@ -86,13 +29,7 @@ HORIZONS = (30, 90, 180, 365)
 
 
 def keyset(df_or_list):
-    """(dataset, patient_id, hadm_id) as a set of tuples, ids as strings.
-
-    patient_id is forced to str because read_csv infers MIMIC-III ids as
-    integers and drops their leading zeros, so a zero-padded id arrives
-    shortened and matches nothing in the joblib files -- an empty intersection
-    rather than an error.
-    """
+    """(dataset, patient_id, hadm_id) as a set of tuples, ids as strings."""
     if isinstance(df_or_list, pd.DataFrame):
         it = df_or_list[KEY].itertuples(index=False)
         return {(str(a), str(b), str(c)) for a, b, c in it}

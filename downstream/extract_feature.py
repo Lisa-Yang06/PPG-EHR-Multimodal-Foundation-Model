@@ -1,38 +1,4 @@
-"""
-STAGE 4: Post-discharge admission-level dual-modality feature extraction.
-
-For each REAL hospital admission from admission_disease_labels.joblib:
-  - sample id: (dataset, patient_id, hadm_id)
-  - prediction origin: dischtime
-
-sEHR:
-  - default window: [dischtime - 12mo, dischtime]
-    (set ehr_anchor='admit' below if pre-admission EHR is desired)
-  - all code types, latest 512
-  - original MedicalBERT -> v_ehr_pre (320)
-  - aligned MedicalBERT + mlp_s + L2 norm -> v_ehr_post (128)
-
-PPG:
-  - reconstruct the same non-overlapping consecutive 10-min blocks used
-    previously: 60 consecutive ~10-s windows
-  - require the ENTIRE 10-min block to lie inside [admittime, dischtime]
-  - if >100 qualifying blocks, take 100 approximately uniformly over time
-  - each 10-min block:
-        60 x 10-s PaPaGei embeddings -> mean -> h_k (512)
-  - admission pre:
-        mean_k(h_k)
-  - admission post:
-        each h_k -> mlp_p -> L2 normalize -> z_k
-        mean_k(z_k) -> L2 normalize
-
-No first-onset exclusion is used. Recurrent/prevalent disease is allowed by
-the new endpoint definition.
-
-Missing modality -> feature = NaN, mask = 0.
-
-Primary labels carried forward:
-  AF, HF, eMACE at 30/90/180/365 days, plus their prior indicators.
-"""
+"""STAGE 4: Post-discharge admission-level dual-modality feature extraction."""
 
 import os
 import sys
@@ -225,21 +191,7 @@ def forward_ppg_segments(
     device,
     gpu_chunk=50,
 ):
-    """
-    signals_list:
-        list/array of K 10-min blocks,
-        each block has shape (60, 1250).
-
-    Returns
-    -------
-    v_ppg_pre:
-        mean of K 10-min PaPaGei representations, shape (512,)
-
-    v_ppg_post:
-        each 10-min representation is projected and L2-normalized exactly
-        as in alignment; those aligned vectors are averaged across the
-        admission and normalized again, shape (128,)
-    """
+    """signals_list: list/array of K 10-min blocks, each block has shape (60, 1250)."""
     n_win = CONFIG['n_windows_per_seg']
     sig_len = CONFIG['window_signal_len']
     n_seg = len(signals_list)
@@ -322,24 +274,7 @@ def forward_ehr(
     tokenizer,
     device,
 ):
-    """
-    sEHR window:
-        [anchor_time - 12mo, anchor_time]
-
-    anchor_time is discharge by default for the current post-discharge
-    prediction task. Set CONFIG['ehr_anchor']='admit' to preserve the old
-    pre-admission-only definition.
-
-    ALL code types, latest 512.
-
-    Returns
-    -------
-    v_ehr_pre:
-        original MedicalBERT pooled embedding, shape (320,)
-
-    v_ehr_post:
-        aligned MedicalBERT -> mlp_s -> L2 normalized, shape (128,)
-    """
+    """sEHR window: [anchor_time - 12mo, anchor_time] anchor_time is discharge by default for the..."""
     hist_ts = np.array(
         pd.to_datetime(history_entry['timestamps'])
     )
@@ -473,29 +408,7 @@ def forward_ehr(
 
 # ── PPG: read full parquet, find ALL consecutive 10-min blocks ────────────
 def load_patient_ppg(pid, dataset):
-    """
-    Read the patient's full ppg.parquet and reconstruct every consecutive
-    NON-OVERLAPPING 10-minute block:
-
-        60 windows, each ~10 s apart,
-        within one (record_id, segment).
-
-    This preserves the previous Stage-4 reconstruction logic.
-
-    Returns
-    -------
-    {
-        'signals':      (N, 60, 1250),
-        'start_times':  (N,),
-        'center_times': (N,),
-        'end_times':    (N,)
-    }
-
-    end_time is defined as:
-        start time of the 60th 10-s window + 10 s
-
-    so the entire signal block spans approximately 10 minutes.
-    """
+    """Read the patient's full ppg.parquet and reconstruct every consecutive NON-OVERLAPPING 10-minute..."""
     ppg_dir = (
         CONFIG['ppg_IV_filtered_dir']
         if dataset == 'IV'
@@ -716,11 +629,7 @@ def canon_pid(raw, dataset):
 
 
 def label_value(row, col):
-    """
-    Preserve censoring:
-      1 / 0 stay numeric
-      NaN stays NaN
-    """
+    """Preserve censoring: 1 / 0 stay numeric NaN stays NaN"""
     x = getattr(row, col)
     if pd.isna(x):
         return np.nan

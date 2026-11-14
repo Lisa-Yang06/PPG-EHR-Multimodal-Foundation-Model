@@ -1,68 +1,4 @@
-"""
-Per-admission metadata for downstream_features_admission_postdisch.joblib.
-
-Two things this file is for:
-
-  1. Candidate gate inputs -- signal quality, EHR volume, PPG timing, length of
-     stay -- for any fusion model that has to decide how much to trust each
-     modality.
-  2. Confounder audit. Every field here is a candidate free predictor: if it
-     forecasts the outcome on its own, a gate that reads it smuggles that
-     prediction into the logit, and "fusion helped" stops being interpretable.
-     Nothing here is safe until it has been scored on its own.
-
-DESCRIBES THE BLOCKS THE EMBEDDING ACTUALLY USED
-------------------------------------------------
-Stage 4 reconstructs every non-overlapping 10-min block inside
-[admittime, dischtime], then caps at max_blocks_per_sample=100 by taking a
-linspace over the globally time-sorted eligible blocks. Across the cohort that
-is 192,884 used out of 769,144 eligible -- a quarter.
-
-Metadata computed over all 769k would describe signal the model never saw. This
-file reproduces the cap exactly (same global sort, same linspace) and computes
-everything over the SELECTED blocks. That is also four times cheaper, since SQI
-is the only part that has to decode waveform data.
-
-The reproduction is checked, not trusted: the number of blocks selected here
-must equal n_ppg_blocks_used stored by stage 4. A mismatch means the selection
-logic has drifted and every SQI figure below describes different signal from
-the embedding.
-
-WHAT IS NEW RELATIVE TO THE PRE-DISCHARGE VERSION
---------------------------------------------------
-  anchor        the prediction origin moved from admittime to dischtime, so
-                every timing field is reported against BOTH. Distance from
-                admit says where in the illness course monitoring happened;
-                distance from discharge says how far the signal sits from the
-                point the label starts counting. They are not independent --
-                gap_from_admit + gap_to_disch = los_h -- and the correlation
-                block at the end makes that visible rather than implied.
-
-  los_h         length of stay, the most suspicious confounder in this design.
-                It bounds how much PPG can exist, it shifts where the label
-                window opens, and it tracks severity. It was not available
-                before because the old anchor was the admission day alone.
-
-  *__prior      carried through from the label file: was this disease already
-                coded on or before discharge. 81-90% of positives have it, and
-                the sEHR window [disch-12mo, disch] contains the codes that set
-                it, so the sEHR branch can nearly read the label off its own
-                input. Any downstream claim about fusion needs a
-                "sEHR + prior" baseline, and this file exists partly so that
-                prior can be audited like any other variable.
-
-  EHR counts    counted over the window actually fed to the model,
-                [dischtime - 12mo, dischtime], not the old matched/strict
-                split. Diagnosis codes carry the admittime of their stay, so
-                the index admission's own codes fall inside this window --
-                that is where *__prior comes from, and n_codes_index_adm
-                measures it directly.
-
-Usage:
-    python extract_postdisch_metadata.py                 # pass 1, minutes
-    python extract_postdisch_metadata.py --with-sqi      # pass 2, hours
-    python extract_postdisch_metadata.py --with-sqi --limit 300   # sample first
-"""
+"""Per-admission metadata for downstream_features_admission_postdisch.joblib."""
 import os
 import sys
 
@@ -138,13 +74,7 @@ def read_ppg_frame(pid, dataset, need_signal):
 
 
 def assemble_blocks(df):
-    """Every non-overlapping run of 60 windows ~10 s apart within a segment.
-
-    Byte-for-byte the same rule as stage 4's load_patient_ppg: consecutive runs
-    inside one (record_id, segment), reset after each complete block so blocks
-    never overlap, and a global sort by start time at the end -- groupby only
-    orders within a segment, and the linspace cap depends on the global order.
-    """
+    """Every non-overlapping run of 60 windows ~10 s apart within a segment."""
     lo, hi = GAP_TOL
     mid = N_WINDOWS_PER_SEG // 2
     pos_l, start_l, center_l, end_l = [], [], [], []
@@ -180,12 +110,7 @@ def assemble_blocks(df):
 
 
 def select_blocks(blocks, admit, disch):
-    """Stage 4's eligibility and cap: whole block inside the stay, then cap.
-
-    Containment is on the FULL block, not its centre: the label window opens at
-    dischtime, so a block straddling discharge would carry signal from after
-    the prediction origin.
-    """
+    """Stage 4's eligibility and cap: whole block inside the stay, then cap."""
     ok = (blocks['starts'] >= admit) & (blocks['ends'] <= disch)
     idx = np.where(ok)[0]
     n_eligible = len(idx)
@@ -199,18 +124,7 @@ def select_blocks(blocks, admit, disch):
 # SQI
 # ══════════════════════════════════════════════════════════════════════════
 def sqi_for_windows(sigs):
-    """(acf, skew, tmpl) per 10-s window; NaN where a metric cannot be formed.
-
-    acf   height of the highest autocorrelation peak in the plausible
-          heart-rate lag range. A pulsatile trace repeats; noise does not.
-    skew  waveform asymmetry. A clean PPG rises fast and falls slowly, so it is
-          positively skewed; artefact tends toward symmetry.
-    tmpl  correlation of each detected beat against the subject's own mean
-          beat. Needs peak detection, which is exactly what fails on the
-          artefact windows it is meant to flag -- those become NaN and are
-          skipped, so this metric is blind in the situation it exists for.
-          Kept for now so the distributions can decide.
-    """
+    """(acf, skew, tmpl) per 10-s window; NaN where a metric cannot be formed."""
     from scipy.stats import skew as _skew
     from scipy.signal import find_peaks
 
@@ -262,12 +176,7 @@ def sqi_for_windows(sigs):
 
 
 def summarise(v):
-    """median and p10 of the finite entries, plus how many were finite.
-
-    p10 alongside the median because the embedding is a flat mean over every
-    used window -- bad windows are already inside it, and a median hides
-    precisely the tail that put them there.
-    """
+    """median and p10 of the finite entries, plus how many were finite."""
     f = v[np.isfinite(v)]
     if f.size == 0:
         return np.nan, np.nan, 0
@@ -282,57 +191,7 @@ MAX_SEQ_LEN = 512
 
 
 def ehr_counts(entry, admit, disch, tokenizer=None):
-    """Reproduce stage 4's forward_ehr selection, step for step.
-
-    The counts here are only meaningful if they describe the SAME codes the
-    encoder consumed, so this mirrors forward_ehr rather than re-deriving a
-    reasonable-looking window. Stage 4 does, in order:
-
-        days = int(window_months * 30.44)              # 12 -> 365, not "a year"
-        anchor_day = Timestamp(anchor_time).normalize()
-        hist_day   = timestamps floored to the day
-        mask = (hist_day >= anchor_day - 365d) & (hist_day <= anchor_day)
-        if len(sub) > 512: keep the 512 with the latest timestamps
-        indices = tokenizer.encode(sub_codes)
-        valid   = indices != 0
-        pooled  = sum(out * valid) / sum(valid)
-
-    Three details matter and are easy to get wrong:
-
-      day granularity   history_db timestamps are mixed -- 19% carry a time,
-                        81% sit at midnight -- and forward_ehr floors both
-                        sides anyway. Comparing raw timestamps would put a
-                        same-day medication (stored 00:00) BEFORE an admission
-                        at 14:30 and classify this stay's own codes as prior
-                        history.
-      365 days          int(12 * 30.44) = 365, not twelve calendar months.
-      valid != 0        codes outside the tokenizer's vocabulary encode to 0
-                        and are excluded from the pooling, so the number the
-                        encoder actually averaged over is smaller than the
-                        number of codes in the window. Passing a tokenizer here
-                        measures that; without one, n_codes_fed is an upper
-                        bound and is flagged as such.
-
-    Stage 4 stores no code count, so there is nothing to reconcile against
-    directly. The one equivalence that IS checkable is
-    (n_codes_window > 0) == (ehr_mask == 1), because forward_ehr returns None
-    when the window is empty; main() asserts it.
-
-    Counts returned
-    ---------------
-    n_codes_window        codes inside the window
-    n_codes_after_trunc   after the 512 cap -- what was tokenized
-    n_codes_fed           after dropping out-of-vocabulary codes; what the
-                          pooling averaged over. Exact with a tokenizer,
-                          otherwise = n_codes_after_trunc and marked in
-                          n_codes_fed_is_upper_bound.
-    n_codes_before_admit  inside the window, on days before the admission day
-    n_codes_index_adm     inside the window, on days from admission to
-                          discharge inclusive -- this stay's own codes.
-                          Procedures and medications carry their real
-                          timestamps during the stay, so `== admittime` would
-                          have counted diagnoses only.
-    """
+    """Reproduce stage 4's forward_ehr selection, step for step."""
     out = {
         'n_codes_window': 0,
         'n_codes_after_trunc': 0,

@@ -1,156 +1,4 @@
-"""
-PLAIN 320 -> 128 -> 1, NO NORMALISATION -- post-discharge cohort. ALL TORCH.
-
-The torch twin of plain_mlp.py. Same rows, same names, same folds, same
-grids; the difference is that every MODEL here is a torch module trained by
-AdamW, where plain_mlp.py fits five of its nine rows with sklearn's
-LogisticRegression under GridSearchCV.
-
-WHY
----
-plain_mlp.py mixes two frameworks, so every "fusion vs baseline" difference
-in it carries a framework difference as well, and on its last run that
-framework difference was the same order as the representation differences
-being compared. Here every row is on one framework and one grid, so a
-difference is a difference of representation or of fusion form and nothing
-else.
-
-Row for row against plain_mlp.py's CSV, the gap IS the framework effect.
-
-WHAT REPLACES C
----------------
-sklearn minimises C*sum(loss) + 0.5*||w||^2, i.e. mean(loss) +
-||w||^2/(2Cn), so its penalty weight is lambda = 1/(2Cn). That role is taken
-here by weight decay on the head, searched over the same 6 x 4 grid, rho-
-filtered, that every other torch row in this file searches -- 21 candidates
-against the 21-point C grid it replaces.
-
-For the PINNED reference row, C = 1e-5 at n ~ 1800 gives lambda ~ 28, so
---wd-a320 defaults to 30, which is also the modal decay the searched rows
-picked on the last real run. It remains a hand-picked value.
-
-StandardScaler and the metrics stay sklearn: preprocessing and measurement,
-not models.
-
-    N_mlp_320_128_1   x -> Linear(320,128) -> Linear(128,1), trained
-                      end to end. No L2 normalisation between the layers,
-                      no PPG, no alpha, no gate.
-
-    N_probe_on_128    that model's 128-d hidden layer, FROZEN, with a fresh
-                      Linear(128,1) trained on it, decay by the same inner
-                      3-fold every other row here gets.
-
-WHY NO NORMALISATION HERE
--------------------------
-linear_fusion.py's M_ rows put F.normalize between the two layers. That is
-not decoration: with a trainable P and no normalisation the convex mixture
-(1-a)Px + a*zp is degenerate, because for any a' the substitution
-
-    w' = (a/a')w      P' = P (1-a)a' / ((1-a')a)
-
-reproduces the logit exactly, so alpha carries no information about the
-function and the selected alpha reports the ratio of the two decays instead
-of anything about the data.
-
-Nothing here mixes, so nothing here needs the unit sphere, and the model
-becomes what a strong-EHR-baseline proposal actually asks for. The cost of
-dropping it is worth stating: with normalisation the score is
-(u.x + c) / ||Px + b||, a genuinely different model class; without it,
-
-    score = w.(Px + b) = (P'w).x + const = u.x + const
-
-which is A320_sEHR_pre's hypothesis class restricted to the <=128-dim row
-space of P. A_sEHR_pca128 matched A320 in every cell, so a label-blind 128-d
-subspace already loses nothing and this row cannot EXCEED A320 through
-capacity. What it can differ by is (a) AdamW with early stopping instead of a
-convex solve, and (b) an L2 penalty on the two FACTORS rather than on the
-composite u, which is a nuclear-norm-like penalty and not ridge.
-
-HOW TO READ N_probe_on_128 -- IMPORTANT
----------------------------------------
-There is no test leakage. P is fitted on outer-train only, the probe is
-fitted on outer-train only, the outer test fold is untouched by both.
-
-But this row is NOT the same kind of number as A_sEHR_pca128, and putting
-them side by side without saying so is misleading:
-
-    A_sEHR_pca128     128 dims chosen WITHOUT looking at any label. The
-                      probe AUROC is a statement about the REPRESENTATION.
-
-    N_probe_on_128    128 dims chosen BY fitting the downstream label. The
-                      probe AUROC is a statement about a two-stage FITTING
-                      PROCEDURE, and the representation cannot be called
-                      general-purpose.
-
-
-PROTOCOL IS COPIED, NOT REIMPLEMENTED
--------------------------------------
-Outer folds, inner 3-fold selection, the candidate grid, the parameter-group
-split and the per-fold packing all come from alpha_fusion.py and
-gated_fusion.py. af._adapter_pack is called with the full [pre|post|ppg]
-matrix even though only v_ehr_pre is read, so the per-fold scaler discipline
-is byte-identical to the M_ and H_ rows. The ONLY difference from
-linear_fusion's M_only is the missing F.normalize, so a difference in the
-numbers cannot come from a difference in protocol, and every row here is
-comparable fold by fold to everything already computed.
-
-UNCERTAINTY: POINT ESTIMATE, INTERVAL, AND THE PAIRED DIFFERENCE
-----------------------------------------------------------------
-The reported estimate is what it has always been: auroc_mean, the mean of the
-five per-fold metrics. The interval is built the same way the estimate is --
-resample PATIENTS within each outer test fold, recompute that fold's metric,
-average the five, and take the 2.5th/97.5th percentiles of those bootstrap
-means.
-
-Resampling is by patient, not admission. One patient can contribute several
-admissions and those rows are correlated, so resampling admissions would count
-them as independent evidence and return an interval that is too narrow. The
-outer CV groups by patient for the same reason. The metric stays
-admission-level; only the resampling unit is the patient.
-
-A fold draw containing one class has no AUROC and is redrawn, so every
-replicate averages the same folds; n_fold_redraws reports how often that
-fired.
-
-The interval covers PATIENT SAMPLING ONLY -- nothing about fold assignment or
-hyperparameter selection, which is the part auroc_std_fold gestures at.
-Neither number is a superset of the other.
-
-  delta_auroc (ci_low, ci_high)   N_gate_alpha minus A320_sEHR_pre_selC, both
-                                  scored on IDENTICAL replicates and
-                                  differenced per replicate.
-
-That difference is the comparison to report. Two marginal intervals
-overlapping does not mean the difference includes zero: the fold-to-fold noise
-the two rows share cancels inside a replicate, so the paired interval is
-narrower than any overlap test between the marginals.
-
-WHY THE POOLED NUMBER IS A DIAGNOSTIC AND NOT THE HEADLINE
-----------------------------------------------------------
-auroc_oof -- one metric over all folds' predictions concatenated -- is still
-reported, without an interval, because it is the thing the cross-fold score
-block exists to explain.
-
-Each outer fold selects its own wd/lr/epoch and returns RAW LOGITS on its own
-scale, so pooling ranks fold-A admissions against fold-B admissions on scales
-never made commensurable. A fold whose logits sit higher drags its rows up the
-joint ranking and depresses the pooled value without any fold discriminating
-worse. The fold mean is immune, being rank-based within a fold.
-
-So a pooled value far below a row's fold mean is a question, not a finding.
-The CROSS-FOLD SCORE SCALE block at the end of a run answers it: if per-fold
-score means swing widely while the within-fold positive-negative gap holds up,
-the gap is a calibration artefact. Building a confidence interval on the
-pooled ranking would have propagated that artefact into the interval, which is
-why it is not done.
-
-The per-admission predictions are written to a companion _oof.csv, so a
-calibration curve, another paired comparison or an error-case listing can be
-built later without retraining.
-
-Usage:
-    python plain_mlp.py --disease AF
-"""
+"""PLAIN 320 -> 128 -> 1, NO NORMALISATION -- post-discharge cohort."""
 import os
 
 import argparse
@@ -181,14 +29,23 @@ import paths
 
 import train_probe_regularized as reg
 import gated_fusion as gf
-import alpha_fusion as af
+import grids
 
 from gated_fusion import (
     DISEASES, HORIZONS, FEATURES_PATH, METADATA_CSV,
     label_col, load_joined, assign_folds, subset_folds, build_scalar_matrix,
 )
 
-N_DIM = af.N_COMPONENTS          # 128
+
+def _af():
+    # Imported on call, not at module load: only the adapter and
+    # embedding-fusion rows below reach alpha_fusion, and score_fusion
+    # imports this file without ever touching them.
+    import alpha_fusion
+    return alpha_fusion
+
+
+N_DIM = grids.N_COMPONENTS          # 128
 
 # alpha IS the PPG weight, so 0.0 reproduces N_probe_on_128 exactly and 1.0 is
 # PPG alone. Uniform on the full convex range, matching alpha_fusion's
@@ -218,38 +75,7 @@ def _alpha_grid(n):
 
 def _fold_boot_indices(y, groups, fold_h, valid_folds, n_boot=N_BOOT,
                        seed=BOOTSTRAP_SEED, max_redraws=BOOT_MAX_REDRAWS):
-    """Replicate row indices for a FOLD-PRESERVING patient-cluster bootstrap.
-
-    The reported point estimate is the mean of the five per-fold metrics, so
-    the interval has to be built the same way: resample WITHIN each outer test
-    fold, recompute that fold's metric, average the five. Resampling across
-    the pooled rows instead would answer a different question and would carry
-    the pooled ranking's cross-fold calibration problem into the interval.
-
-    The independence unit is the PATIENT. One patient can contribute several
-    admissions and those share everything stable about them, so resampling
-    admissions would treat correlated rows as independent evidence and return
-    an interval that is too narrow. assign_folds already guarantees a patient
-    never spans two folds, so "the patients of fold k" is unambiguous and no
-    patient can appear in two folds of one replicate.
-
-    A patient drawn twice contributes its admissions twice, so the admission
-    count per fold varies between replicates. That is the cluster bootstrap
-    working, not a defect.
-
-    A fold draw containing only one class has no AUROC. That fold is redrawn
-    until valid, so every replicate averages the same folds; dropping the fold
-    instead would average four folds in some replicates and five in others,
-    which is a different estimand. n_fold_redraws reports how often a redraw
-    was needed.
-
-    The draws depend only on (y, groups, fold_h, valid_folds, seed) and NOT on
-    any model's scores, so every row in a cell is bootstrapped on identical
-    patient draws. That is what makes a paired difference between two rows
-    valid: the fold-to-fold noise they share cancels within a replicate.
-
-    Returns (list of {fold_id: row_index_array}, n_fold_redraws).
-    """
+    """Replicate row indices for a FOLD-PRESERVING patient-cluster bootstrap."""
     y = np.asarray(y)
     groups = np.asarray(groups)
     fold_h = np.asarray(fold_h)
@@ -282,15 +108,7 @@ def _fold_boot_indices(y, groups, fold_h, valid_folds, n_boot=N_BOOT,
 
 
 def fold_mean_boot(y, score, boots, valid_folds):
-    """Bootstrap distribution of the MEAN-ACROSS-FOLDS metric.
-
-    One value per replicate: the metric on each fold's resampled rows,
-    averaged over folds -- the same shape as the reported point estimate.
-
-    AUROC and AUPRC come from the SAME replicates, so their intervals are
-    paired rather than independently drawn, and two rows scored through this
-    function with the same `boots` can be differenced replicate by replicate.
-    """
+    """Bootstrap distribution of the MEAN-ACROSS-FOLDS metric."""
     y = np.asarray(y)
     score = np.asarray(score, dtype=np.float64)
     aucs = np.empty(len(boots))
@@ -312,20 +130,7 @@ def _pct_ci(v):
 
 
 def pooled_oof_point(y, oof):
-    """Pooled out-of-fold AUROC/AUPRC -- a DIAGNOSTIC, not the headline.
-
-    One metric over all folds' predictions concatenated. It is reported so the
-    cross-fold score block has something to explain, and it is deliberately
-    NOT given a confidence interval: each fold selects its own wd/lr/epoch and
-    returns raw logits on its own scale, so pooling ranks fold-A admissions
-    against fold-B admissions on scales never made commensurable. A fold whose
-    logits happen to sit higher drags its rows up the joint ranking, which
-    depresses the pooled number without any fold discriminating worse.
-
-    Read it beside the per-fold score block below: if a row's pooled value is
-    far under its fold mean while its within-fold positive-negative gap is
-    intact, the gap is a calibration artefact, not evidence about the model.
-    """
+    """Pooled out-of-fold AUROC/AUPRC -- a DIAGNOSTIC, not the headline."""
     y = np.asarray(y)
     oof = np.asarray(oof, dtype=np.float64)
     ok = np.isfinite(oof)
@@ -337,14 +142,7 @@ def pooled_oof_point(y, oof):
 
 
 class PlainMLP(nn.Module):
-    """320 -> 128 -> 1. Nothing between the layers.
-
-    The projection is named `adapter` and `gate` is set to None so that
-    af.adapter_groups -- which reads model.adapter.named_parameters(),
-    model.head, and model.gate -- applies with no special case. The forward
-    signature takes (ez, zp, xg) because gf._train_once passes three tensors;
-    zp and xg are ignored. This model uses NO PPG.
-    """
+    """320 -> 128 -> 1."""
 
     def __init__(self, pre_dim, dim, freeze_proj=False):
         super().__init__()
@@ -372,17 +170,7 @@ class PlainMLP(nn.Module):
 
 
 class LinearHead(nn.Module):
-    """Linear(d, 1). The torch stand-in for sklearn's LogisticRegression.
-
-    forward takes (ez, zp, xg) so gf._train_once drives it unchanged; zp and
-    xg are ignored. `gate = None` lets head_only_groups and gate_head_groups
-    both apply without a special case.
-
-    What replaces C: sklearn minimises C*sum(loss) + 0.5*||w||^2, i.e.
-    mean(loss) + ||w||^2/(2*C*n), so its penalty weight is lambda = 1/(2Cn).
-    Here that role is played by weight_decay on the head, searched over the
-    SAME grid every other row in this file searches.
-    """
+    """Linear(d, 1)."""
 
     def __init__(self, in_dim):
         super().__init__()
@@ -395,26 +183,7 @@ class LinearHead(nn.Module):
 
 
 class AlphaOnFrozen(nn.Module):
-    """Per-sample convex mixture of two FROZEN 128-d blocks, then a head.
-
-        a_i    = sigmoid(g . scalars_i)
-        fused  = (1 - a_i) * h_i + a_i * zp_i
-        logit  = w . fused
-
-    Nothing upstream trains: h is N_mlp_320_128_1's hidden layer, already
-    fitted and frozen, and zp is v_ppg_post. That is what makes alpha
-    identifiable here. With a TRAINABLE projection it is not -- for any a'
-    the substitution w' = (a/a')w, P' = P(1-a)a'/((1-a')a) reproduces the
-    logit exactly, so the selected alpha would report the ratio of the two
-    decays rather than anything about the data. Both blocks being fixed
-    numeric matrices removes that freedom.
-
-    Both are put through the same per-coordinate StandardScaler before
-    mixing, so each block has expected squared norm equal to its width and
-    neither swamps the other. h carries whatever scale training left it at
-    and zp has unit norm, so without this alpha would not be a block-level
-    weight.
-    """
+    """Per-sample convex mixture of two FROZEN 128-d blocks, then a head."""
 
     def __init__(self, dim, gate_in_dim, alpha_fixed=None, mode='convex'):
         super().__init__()
@@ -467,8 +236,7 @@ class AlphaOnFrozen(nn.Module):
 
 
 def gate_head_groups(model, wd, wd_head):
-    """Gate and head, biases exempt. Under --wd-mode shared the caller
-    passes the same value for both, so this is one decay."""
+    """Gate and head, biases exempt."""
     g = [{'params': [model.head.weight], 'weight_decay': wd_head},
          {'params': [model.head.bias], 'weight_decay': 0.0}]
     if model.gate is not None:
@@ -478,14 +246,7 @@ def gate_head_groups(model, wd, wd_head):
 
 
 def sel_desc(**cols):
-    """'wd 1,30 | lr 0.01,0.003 | epoch 6,3' from name -> per-fold values.
-
-    Built where the values live, by the code that selected them, so a row can
-    only ever describe its own search. The previous arrangement had one shared
-    pack() read sel/eps from the enclosing scope, and since only the MLP row
-    wrote to those, five of nine rows reported the MLP's hyperparameters as
-    their own.
-    """
+    """'wd 1,30 | lr 0.01,0.003 | epoch 6,3' from name -> per-fold values."""
     def fmt(v):
         return f'{v:g}' if isinstance(v, float) else str(v)
     return '  '.join(f"{k} {','.join(fmt(v) for v in vals)}"
@@ -494,24 +255,7 @@ def sel_desc(**cols):
 
 def torch_linear_cv(X_tr, X_te, y_tr, inner_splits, cands, seed, args,
                     fixed=None, surface=None):
-    """StandardScaler -> Linear(d,1) -> AdamW, weight decay by inner 3-fold.
-
-    The torch counterpart of what a Pipeline([StandardScaler, Logistic]) under
-    GridSearchCV(C) did. The scaler is refit INSIDE every inner split, so the
-    validation rows never shape the statistics the selection is read off, and
-    again on the full outer-train for the refit.
-
-    fixed=(wd, lr) skips selection entirely and trains the full epoch budget
-    with no validation -- the analogue of fitting at a pinned C. Returns
-    (test scores, wd, lr, epoch).
-
-    surface, if given a list, receives one dict per CANDIDATE: its mean
-    inner-validation AUROC and its median selected epoch. The selection
-    already computes all of them and keeps only the argmax, so this is the
-    hyperparameter-sensitivity surface at no extra cost. An out-parameter
-    rather than a fifth return value, because four call sites unpack the
-    existing four.
-    """
+    """StandardScaler -> Linear(d,1) -> AdamW, weight decay by inner 3-fold."""
     d = X_tr.shape[1]
     T = lambda z: torch.tensor(z, dtype=torch.float32)
     Z = lambda n: T(np.zeros((n, 1)))
@@ -573,18 +317,13 @@ def torch_linear_cv(X_tr, X_te, y_tr, inner_splits, cands, seed, args,
 
 
 def inner_folds(y_tr, g_tr, seed):
-    """The inner 3-fold split every row in this file selects on.
-
-    Stratified on "this patient is ever positive" and grouped by patient, the
-    same construction run_plain uses, so the baseline rows and the fusion rows
-    select on identical splits.
-    """
+    """The inner 3-fold split every row in this file selects on."""
     out = []
     pos = np.unique(g_tr[y_tr == 1])
-    if len(pos) < af.N_INNER_E:
+    if len(pos) < grids.N_INNER_E:
         return out
     ever = np.isin(g_tr, pos).astype(int)
-    sp = StratifiedGroupKFold(n_splits=af.N_INNER_E, shuffle=True,
+    sp = StratifiedGroupKFold(n_splits=grids.N_INNER_E, shuffle=True,
                               random_state=seed)
     for i_tr, i_va in sp.split(np.zeros((len(y_tr), 1)), ever, groups=g_tr):
         if len(np.unique(y_tr[i_tr])) >= 2:
@@ -594,16 +333,12 @@ def inner_folds(y_tr, g_tr, seed):
 
 def wd_lr_candidates(args):
     """(wd, lr) under the rho guard -- the grid every torch row here shares."""
-    return [(w, lr) for w in args.wd_proj for lr in af.LR_GRID_E
-            if lr * w <= af.MAX_RHO]
+    return [(w, lr) for w in args.wd_proj for lr in grids.LR_GRID_E
+            if lr * w <= grids.MAX_RHO]
 
 
 def run_torch_baseline(X, y, groups, folds, args, tag, fixed=None):
-    """A 320-d probe as a torch row. The outer loop reg.run_cv used to run.
-
-    fixed=(wd, lr) reproduces the pinned-C reference: no inner CV, no early
-    stopping, the full epoch budget at one configuration.
-    """
+    """A 320-d probe as a torch row."""
     cands = wd_lr_candidates(args)
     auc, ap, sw, sl, se = [], [], [], [], []
     # Every admission's outer-test score, in the row order of y. subset_folds
@@ -635,7 +370,7 @@ def run_torch_baseline(X, y, groups, folds, args, tag, fixed=None):
         'auroc_std_fold': float(np.std(auc)) if auc else np.nan,
         'auprc_mean': float(np.mean(ap)) if ap else np.nan,
         'auprc_std_fold': float(np.std(ap)) if ap else np.nan,
-        'auroc_per_fold': af._pf(auc), 'auprc_per_fold': af._pf(ap),
+        'auroc_per_fold': _af()._pf(auc), 'auprc_per_fold': _af()._pf(ap),
         'alpha_mean': np.nan, 'alpha_std_within': np.nan,
         'alpha_std_across': np.nan, 'alpha_per_fold': '',
         'n_valid_folds': len(auc), 'folds_without_selection': n_no_sel,
@@ -654,22 +389,18 @@ def run_torch_baseline(X, y, groups, folds, args, tag, fixed=None):
 
 
 def head_only_groups(model, wd, wd_head):
-    """Only the head trains. The projection is not in the optimiser at all,
-    so no step and no decoupled decay can touch it and it stays at its
-    initialisation exactly."""
+    """Only the head trains."""
     return [{'params': [model.head.weight], 'weight_decay': wd_head},
             {'params': [model.head.bias], 'weight_decay': 0.0}]
 
 
 def candidates(args, frozen=False):
-    """(alpha, wd_head, lr, wd_proj) per row. ONE definition, used both by
-    run_plain and by the startup print -- they disagreed once, the log
-    claiming 113 while the search ran 21."""
+    """(alpha, wd_head, lr, wd_proj) per row."""
     if frozen:
         # No projection decay to search: P is not in the optimiser.
         return [(0.0, wh, lr, 0.0)
-                for wh in af.WD_HEAD_GRID for lr in af.LR_GRID_E
-                if lr * wh <= af.MAX_RHO]
+                for wh in grids.WD_HEAD_GRID for lr in grids.LR_GRID_E
+                if lr * wh <= grids.MAX_RHO]
     if args.wd_mode == 'shared':
         # ONE decay for both layers. The two are not regularising different
         # objects here -- this is a plain MLP, not a residual on a frozen
@@ -683,30 +414,13 @@ def candidates(args, frozen=False):
         # number of candidates, so the trained-vs-random comparison carries
         # no selection-noise asymmetry in either direction.
         return [(0.0, w, lr, w)
-                for w in args.wd_proj for lr in af.LR_GRID_E
-                if lr * w <= af.MAX_RHO]
-    return af.adapter_candidates('only', args.wd_proj, args.lr_adapter)
+                for w in args.wd_proj for lr in grids.LR_GRID_E
+                if lr * w <= grids.MAX_RHO]
+    return _af().adapter_candidates('only', args.wd_proj, args.lr_adapter)
 
 
 def run_plain(Xa, M, y, groups, folds, gate_input, args, frozen=False):
-    """Both rows, from ONE model per outer fold.
-
-    Selection, refit and scoring are the 'only' branch of
-    linear_fusion.run_linear with PlainMLP substituted; the probe is then
-    fitted on the refit model's hidden layer inside the same fold.
-
-    frozen=True is the random-projection control: P stays at its random
-    initialisation and only the head trains, so the row answers whether the
-    trained projection is doing anything the head could not do behind a
-    random one. It returns ONE row and no probe -- a convex probe on a
-    random projection is a different question.
-
-    The control searches wd_head x lr only, since there is no projection
-    decay to search. That is 6 candidates against the trained row's 36, so
-    the control gets LESS opportunity to overfit the inner CV; if the two
-    rows come out equal, that asymmetry is working against the conclusion,
-    not for it.
-    """
+    """Both rows, from ONE model per outer fold."""
     pre_dim, dim = args.pre_dim, N_DIM
     cands = candidates(args, frozen)
 
@@ -748,16 +462,16 @@ def run_plain(Xa, M, y, groups, folds, gate_input, args, frozen=False):
         # projection was selected on, rather than drawing its own.
         inner_splits = []
         pos = np.unique(gtr[ytr == 1])
-        if len(pos) >= af.N_INNER_E:
+        if len(pos) >= grids.N_INNER_E:
             ever = np.isin(gtr, pos).astype(int)
-            sp = StratifiedGroupKFold(n_splits=af.N_INNER_E, shuffle=True,
+            sp = StratifiedGroupKFold(n_splits=grids.N_INNER_E, shuffle=True,
                                       random_state=seed)
             for i_tr, i_va in sp.split(np.zeros((len(ytr), 1)), ever,
                                        groups=gtr):
                 if len(np.unique(ytr[i_tr])) < 2:
                     continue
                 inner_splits.append((i_tr, i_va))
-                pk = af._adapter_pack(Xtr, Mtr, ytr, i_tr, i_va, gate_input,
+                pk = _af()._adapter_pack(Xtr, Mtr, ytr, i_tr, i_va, gate_input,
                                       pre_dim, dim)
                 if pk is not None:
                     packs.append(pk)
@@ -776,7 +490,7 @@ def run_plain(Xa, M, y, groups, folds, gate_input, args, frozen=False):
                         wd_head=wh, n_epochs=args.epochs, return_epoch=True,
                         eval_every=args.eval_every, make_model=mk,
                         make_groups=(head_only_groups if frozen else
-                                     af.adapter_groups(wp, args.lr_adapter)),
+                                     _af().adapter_groups(wp, args.lr_adapter)),
                     )
                     if va is not None:
                         vas.append(va)
@@ -819,7 +533,7 @@ def run_plain(Xa, M, y, groups, folds, gate_input, args, frozen=False):
             dim, 1, 0, seed, 0.0, lr, True,
             wd_head=wh, n_epochs=ep, make_model=mk,
             make_groups=(head_only_groups if frozen else
-                         af.adapter_groups(wp, args.lr_adapter)),
+                         _af().adapter_groups(wp, args.lr_adapter)),
         )
 
         with torch.no_grad():
@@ -1062,7 +776,7 @@ def run_plain(Xa, M, y, groups, folds, gate_input, args, frozen=False):
             'auroc_std_fold': float(np.std(auc)) if auc else np.nan,
             'auprc_mean': float(np.mean(ap)) if ap else np.nan,
             'auprc_std_fold': float(np.std(ap)) if ap else np.nan,
-            'auroc_per_fold': af._pf(auc), 'auprc_per_fold': af._pf(ap),
+            'auroc_per_fold': _af()._pf(auc), 'auprc_per_fold': _af()._pf(ap),
             # No gate and no mixture in either row. NaN, not 0.0: a printed
             # 0.000 would read as "alpha was selected and came out zero".
             'alpha_mean': np.nan, 'alpha_std_within': np.nan,
@@ -1100,14 +814,7 @@ def run_plain(Xa, M, y, groups, folds, gate_input, args, frozen=False):
     if frozen:
         return [pack('N_randproj_frozen', auc_e, ap_e, oof_arr=oof_e)]
     def coef(ce, cp):
-        """The twelve coefficient fields every fusion row fills.
-
-        ce is the sEHR-side coefficient per fold, cp the PPG-side. Every
-        fusion form has both, and they differ only in how they are
-        constrained -- convex sums to one, residual pins ce at 1, free
-        constrains neither -- so reporting them the same way puts the
-        constraint on the page instead of in the row's name.
-        """
+        """The twelve coefficient fields every fusion row fills."""
         return {'coef_ehr_per_fold': ','.join(f'{v:.4f}' for v in ce),
                 'coef_ppg_per_fold': ','.join(f'{v:.4f}' for v in cp),
                 'coef_ehr_mean': float(np.mean(ce)) if ce else np.nan,
@@ -1207,7 +914,7 @@ def main():
     ap_.add_argument('--gate-input', choices=['scalars', 'emb'],
                      default='scalars',
                      help=('unused -- neither row has a gate. Kept only so '
-                           'af._adapter_pack can be called with the same '
+                           'alpha_fusion._adapter_pack can be called with the same '
                            'signature the M_ and H_ rows use.'))
     # These three default to the CONFIGURATION THE OTHER ROWS ARE ON, not to
     # None. In alpha_fusion and linear_fusion they default off to preserve
@@ -1304,8 +1011,8 @@ def main():
     global ALPHA_GRID
     ALPHA_GRID = _alpha_grid(int(args.alpha_points))
     args.lr = [float(v) for v in str(args.lr).split(',') if v]
-    af.LR_GRID_E = list(args.lr)
-    # This file's decay grid, not alpha_fusion's. Rebinding af.WD_HEAD_GRID
+    grids.LR_GRID_E = list(args.lr)
+    # This file's decay grid, not alpha_fusion's. Rebinding grids.WD_HEAD_GRID
     # for this process is the same mechanism the line above uses on
     # LR_GRID_E: adapter_candidates resolves both module globals at call
     # time, and nothing else runs in this process. Kept local because the top
@@ -1314,8 +1021,8 @@ def main():
     # and reachable for their encoder -- the split-axis asymmetry a shared
     # grid exists to prevent. Their grids are theirs to change, in a run
     # aimed at them.
-    af.WD_HEAD_GRID = list(args.wd_proj)
-    af.WD_GATE_GRID = af.WD_HEAD_GRID
+    grids.WD_HEAD_GRID = list(args.wd_proj)
+    grids.WD_GATE_GRID = grids.WD_HEAD_GRID
 
     print('=' * 100)
     print('PLAIN 320 -> 128 -> 1, NO NORMALISATION')
@@ -1348,21 +1055,21 @@ def main():
           "projection do anything?")
     print(f"  N_probe_on_128  : that model's {N_DIM}-d layer frozen, "
           f"StandardScaler -> Linear({N_DIM},1), wd and lr by inner "
-          f"{af.N_INNER_E}-fold")
+          f"{grids.N_INNER_E}-fold")
     # lr_adapter=None means the projection group takes --lr, which is the
     # default here; print the EFFECTIVE rate rather than the flag, so the log
     # says what the run did and not what was typed.
     if args.wd_mode == 'shared':
         print(f"  ONE shared wd {args.wd_proj} for both layers  x  "
-              f"lr {af.LR_GRID_E}")
+              f"lr {grids.LR_GRID_E}")
     else:
-        print(f"  wd_proj {args.wd_proj}  x  wd_head {af.WD_HEAD_GRID}  x  "
-              f"lr {af.LR_GRID_E}")
+        print(f"  wd_proj {args.wd_proj}  x  wd_head {grids.WD_HEAD_GRID}  x  "
+              f"lr {grids.LR_GRID_E}")
     # The grid is ragged whenever more than one rate is searched. Print the
     # reachable set rather than leaving it to be inferred from MAX_RHO.
-    print(f"  rho = lr*wd capped at {af.MAX_RHO}, so reachable decays are:")
-    for _lr in af.LR_GRID_E:
-        _ok = [w for w in args.wd_proj if _lr * w <= af.MAX_RHO]
+    print(f"  rho = lr*wd capped at {grids.MAX_RHO}, so reachable decays are:")
+    for _lr in grids.LR_GRID_E:
+        _ok = [w for w in args.wd_proj if _lr * w <= grids.MAX_RHO]
         print(f"      lr {_lr:<8g} wd {_ok}")
     if args.lr_adapter is not None:
         print(f"  projection group overrides lr to {args.lr_adapter:g}")
@@ -1384,7 +1091,7 @@ def main():
           f"{len(candidates(args, frozen=True))} for the frozen control, "
           f"{len(wd_lr_candidates(args))} for each linear probe,")
     print(f"              {len(ALPHA_GRID) * len(wd_lr_candidates(args))} "
-          f"for each fixed-alpha row; each on {af.N_INNER_E} inner folds")
+          f"for each fixed-alpha row; each on {grids.N_INNER_E} inner folds")
     print()
     print(f"  N_fixed_alpha       : (1-a)*h + a*zp, a a HYPERPARAMETER, "
           f"{len(ALPHA_GRID)} points 0..1 searched jointly with C.")
@@ -1454,11 +1161,7 @@ def main():
             cell_rows, cell_oof = [], {}
 
             def finish(r):
-                """Bank the predictions and hold the row for the cell-level CI.
-
-                Applied to EVERY row before it is appended, so no row can
-                reach the CSV without its pooled diagnostic and its interval.
-                """
+                """Bank the predictions and hold the row for the cell-level CI."""
                 arr = r.pop('_oof', None)
                 if arr is None:
                     return r
@@ -1868,7 +1571,7 @@ def main():
     print('             co-adaptation of the projection to its own head, '
           'not a')
     print('             framework difference.')
-    print('  vs plain_mlp.py : identical rows, folds and grids, sklearn '
+    print('  vs the sklearn probe : identical rows, folds and grids, '
           'models')
     print('             swapped for torch ones. Row for row, that gap IS '
           'the')

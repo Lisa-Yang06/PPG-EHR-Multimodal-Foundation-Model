@@ -1,72 +1,4 @@
-"""
-STAGE 5b: properly regularised probes (replaces the hand-rolled Adam loop).
-
-WHY THIS EXISTS
----------------
-Diagnostics on train_probe_admission.py showed every probe saturating train
-AUROC on the both-modality subset while test AUROC fell, and the one variant
-that did not saturate lost that property as soon as its features were scaled.
-
-Two conclusions:
-  1. torch.optim.Adam(weight_decay=...) adds L2 to the GRADIENT, and Adam's
-     per-parameter normalisation largely cancels it. The knob is inert: raising
-     wd by orders of magnitude still memorises. (This is exactly why AdamW
-     exists.)
-  2. The only thing that kept ehr_post from memorising was its small magnitude
-     -- L2-normalised rows have a per-feature std far below the unit std
-     StandardScaler produces. That is accidental implicit regularisation, not a
-     modelling choice, and it means the reported EHR_post advantage was an
-     artefact of feature scale rather than of the alignment projection.
-
-So: LogisticRegression with a real L2 penalty, C chosen by inner CV on the
-training folds only. Scale-invariant by construction, so StandardScaler is now
-safe to apply to everything uniformly.
-
-WHAT IS REPORTED
-----------------
-- TRAIN auroc next to TEST auroc, always. If train == 1.000 the row is
-  memorised and the test number means nothing; this must be visible.
-- chosen C per fold (median), so over/under-regularisation is diagnosable.
-- a SHUFFLED-LABEL control per row: labels permuted across samples, whole CV
-  re-run. A correctly wired pipeline gives ~0.5 here. If it does not, the
-  leak is in
-  the harness, not the features.
-
-POPULATION
-----------
-One only: ppg_mask==1 & ehr_mask==1 (953 admissions, 3/7/9/17 positives). Every
-row -- single-modality and fusion alike -- sees identical samples and identical
-folds, which is the whole point of the table.
-
-An earlier version also emitted population='all' rows (EHR probes over all 1638
-admissions, 10/31/52/95 positives) into the SAME csv. Those are removed: a read
-that forgot to filter population=='both' compared numbers across cohorts with
-different positive rates, and the column invited exactly that mistake. Run the
-EHR-only-with-more-power question as its own analysis if it is wanted.
-
-COMPARABILITY WITH train_probe_concat_fusion.py
------------------------------------------------
-Deliberately identical: DATA_PATH, HORIZONS, the both-subset predicate, the
-outer 5-fold StratifiedGroupKFold(shuffle, seed 42) grouped by patient, the
-inner 3-fold StratifiedGroupKFold(shuffle, seed 42), C_GRID, DEFAULT_C,
-MIN_POS_FOR_INNER_CV, every LogisticRegression argument, the scaler-first
-pipeline, the single-class-fold skip, the shuffled-label control, and the
-metric field names.
-
-The intended difference is the joint embedding: this file mixes into 128-d with
-a selected alpha, that file concatenates into 256-d. One unintended difference
-remains and is NOT fixed here: that file averages five outer partitions
-(seeds 42-46) and reports auroc_std_repeat, this file evaluates one partition
-and reports auroc_std_fold. The two spreads are not interchangeable; only the
-seed-42 partition of that file is comparable to these numbers.
-
-Outer CV: 5-fold StratifiedGroupKFold, group=patient_id, seed 42.
-Inner CV: 3-fold StratifiedGroupKFold on the training portion, scoring=roc_auc.
-
-Usage (compute node -- ~4700 logistic fits, minutes not seconds):
-    python train_probe_regularized.py
-    python train_probe_regularized.py --no-shuffle-control   # ~2x faster
-"""
+"""STAGE 5b: properly regularised probes (replaces the hand-rolled Adam loop)."""
 import os
 import sys
 
@@ -141,31 +73,7 @@ def make_folds(groups, y, n_splits=N_FOLDS_OUTER, seed=RANDOM_SEED):
 
 
 class FusionMixer(BaseEstimator, TransformerMixin):
-    """Mix the two aligned 128-d vectors with weight alpha.
-
-    Input X is [v_ehr | v_ppg] concatenated (dim*2 columns). Output is the
-    fused dim-column matrix. Being a pipeline step means alpha is an ordinary
-    sklearn hyperparameter, so GridSearchCV selects it jointly with C using
-    inner-fold validation only -- the outer test fold never influences it.
-
-    It sits AFTER StandardScaler, and that order is what makes this probe an
-    exact restriction of the concatenation probe. Writing a for the standardised
-    EHR columns and b for the standardised PPG columns,
-
-        z = (a + alpha*b) / (1 + alpha)
-        logit = w'z = [w/(1+alpha)]' a  +  [alpha*w/(1+alpha)]' b
-
-    which is concatenation under the constraint w_ppg = alpha * w_ehr. alpha = 0
-    therefore reproduces the EHR_post row exactly, and no alpha can beat
-    concatenation on the training objective -- only, through the smaller
-    hypothesis class, on held-out data.
-
-    (This file previously mixed BEFORE scaling. The old comment claiming the
-    1/(1+alpha) factor is "removed downstream by StandardScaler, so alpha
-    controls direction only" described that arrangement and no longer applies:
-    the constant now survives into the logit, where the L2 penalty and the
-    searched C absorb it.)
-    """
+    """Mix the two aligned 128-d vectors with weight alpha."""
     def __init__(self, alpha=0.0, dim=128):
         self.alpha = alpha
         self.dim = dim
@@ -179,24 +87,7 @@ class FusionMixer(BaseEstimator, TransformerMixin):
 
 
 def build_estimator(fusion=False, dim=128):
-    """StandardScaler FIRST, then the optional mixer, then L2 logistic.
-
-    class_weight='balanced' mirrors the pos_weight=n_neg/n_pos used before.
-    Scaling is safe because the L2 penalty makes the fit scale-aware.
-
-    The scaler has to come first, and not only so that the single-modality rows
-    and the fusion row share a front end. It is what makes the fusion model a
-    STRICT SPECIAL CASE of the concatenation model -- see FusionMixer for the
-    algebra. With the mixer first (as this file used to have it) the scaler is
-    fit on the already-fused columns, so its means and variances depend on
-    alpha, the nesting breaks, and "concatenation subsumes every fixed mixing
-    ratio" stops being true of the models actually fitted here.
-
-    Cost of the order: the fused columns are no longer unit-variance, since
-    standardisation happens before the aggregation. That only introduces a
-    global scale, which the L2 penalty absorbs through C -- and C is searched
-    in the inner CV anyway.
-    """
+    """StandardScaler FIRST, then the optional mixer, then L2 logistic."""
     steps = [('sc', StandardScaler())]
     if fusion:
         steps.append(('mix', FusionMixer(dim=dim)))
@@ -208,22 +99,7 @@ def build_estimator(fusion=False, dim=128):
 
 def run_cv(X, y, groups, tag, fusion=False, dim=128,
            make_est=None, alpha_grid=None, folds=None):
-    """Nested CV.
-
-    Inner 3-fold CV over the outer-training patients selects (alpha, C) jointly
-    when fusion=True, or C alone otherwise. The winning setting is refit on the
-    FULL outer-training set, then scored once on the outer test fold.
-
-    make_est / alpha_grid exist so a sibling script can reuse this function
-    verbatim with a different mixer or a frozen alpha, rather than copying the
-    body and letting the two drift. Both default to None, in which case the
-    behaviour is exactly what this file did before they were added:
-    build_estimator(fusion, dim) and the module-level ALPHA_GRID.
-
-    make_est must be a zero-argument callable returning a fresh Pipeline whoses
-    mixing step is named 'mix' with an `alpha` parameter, so that
-    'mix__alpha' addresses it and the fallback path can force alpha to 0.
-    """
+    """Nested CV."""
     folds = make_folds(groups, y) if folds is None else folds
     tr_auc, te_auc, te_ap, chosen_C, chosen_a, n_pos_te = [], [], [], [], [], []
     n_defaulted = 0
@@ -286,7 +162,8 @@ def run_cv(X, y, groups, tag, fusion=False, dim=128,
         if a_used is not None:
             chosen_a.append(a_used)
 
-    # Field names follow train_probe_concat_fusion.py so the two CSVs can be
+    # Field names follow the concat-fusion probe (not published here) so
+    # the two CSVs can be
     # concatenated on metric name. This file evaluates ONE outer partition, so
     # it reports the fold-to-fold spread (auroc_std_fold) and no _repeat
     # columns; n_repeats / n_folds_total are constants here and exist only to
@@ -342,7 +219,7 @@ def main():
     # cohort and a different positive rate, so any read that forgot to filter
     # population=='both' silently compared across cohorts. Every row here now
     # sees identical samples and identical folds, as in
-    # train_probe_concat_fusion.py.
+    # the concat-fusion probe.
     FEATS = [('v_ehr_pre_mlp',  'EHR_pre'),
              ('v_ehr_post_mlp', 'EHR_post'),
              ('v_ppg_pre_mlp',  'PPG_pre'),
@@ -456,7 +333,7 @@ def main():
     print("     of alpha, which with <20 positives is the expected failure.")
     print("  Judge any delta against auroc_std_fold on the row.")
     print("  Fusion is concatenation restricted to w_ppg = alpha*w_ehr, so it")
-    print("     cannot beat train_probe_concat_fusion.py's Joint_concat on the")
+    print("     cannot beat the concat-fusion probe's Joint_concat on the")
     print("     training objective -- only on held-out data, via lower variance.")
 
 

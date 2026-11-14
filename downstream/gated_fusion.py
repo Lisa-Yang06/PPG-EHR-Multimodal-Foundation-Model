@@ -1,135 +1,4 @@
-"""
-GATED FUSION -- post-discharge downstream cohort.
-
-This is a minimal adaptation of the previous gated-fusion script. The fusion
-model, optimizer, four-setting comparison, shared-across-horizons design,
-patient-grouped outer CV, gate-input ablations, and case-level analysis are
-kept. The changes are limited to what the rebuilt admission cohort requires:
-
-  * clean post-discharge feature/metadata files;
-  * merge by (dataset, patient_id, hadm_id);
-  * AF, HF, and eMACE are run as three separate disease families;
-  * each disease has one shared gate across 30/90/180/365 days;
-  * censored (NaN) labels are removed only for that disease x horizon row;
-  * outer folds are disease-specific and stratified on the 365-day STATUS:
-        0 = usable negative, 1 = positive, 2 = censored;
-    NaN is never converted to 0;
-  * gate scalars are updated to the new metadata definitions:
-        acf_p10, skew_p10, n_codes_fed, gap_median_from_admit_h.
-
-Fusion is unchanged:
-
-    z_fused,i = alpha_i * z_PPG,i + (1 - alpha_i) * z_sEHR,i
-    alpha_i   = sigmoid(g(x_i))
-
-Main gate inputs are the same advisor-specified categories as before:
-PPG embedding, sEHR embedding, PPG signal quality, EHR-code amount,
-PPG-to-admission timing, and prediction horizon.
-
-SETTINGS
---------
-    1   EHR_post
-    2   PPG_post
-    1b  EHR_post + gate scalars
-    3   fixed alpha, selected inside the inner CV
-    4   learned alpha_i
-
-GATE INPUT VARIANTS
--------------------
-    default            embeddings + scalars + horizon
-    --no-emb-in-gate   scalars + horizon
-    --emb-only-gate    embeddings + horizon
-
-sEHR SOURCE FOR THE MIXER AND THE GATE  (--ehr-source)
-------------------------------------------------------
-    aligned   v_ehr_post_mlp. The default; unchanged behaviour.
-    randmlp   L2(mlp_s_random(v_ehr_pre_mlp)) -- same architecture and same L2
-              as the aligned projection, but never trained.
-    pca       PCA(128) of v_ehr_pre_mlp, block-scaled. SETTING 4 ONLY.
-
-WHY pca TOUCHES SETTING 4 ALONE
--------------------------------
-0e_EHR_pre_pca128 showed a label-blind PCA of the same 320-d input matching
-0a_EHR_pre, so 128 dimensions are not what costs v_ehr_post its deficit on HF
-and eMACE -- the aligned projection lost the useful directions rather than the
-budget. That makes PCA-128 the strong
-128-d sEHR side the learned gate has never had: setting 4 has only ever
-mixed v_ehr_post (degraded) or a random projection.
-
-Settings 3 and the alpha sweep keep v_ehr_post on purpose. The comparison
-this mode is for is setting 4 against setting 4 in the aligned and randmlp
-runs -- same folds, same code, same gate, three different sEHR sides.
-Swapping the mixer settings too would have changed two things at once.
-
-The PCA is fitted INSIDE each outer fold rather than once over the cohort:
-it reads the feature matrix, so a cohort-wide fit would let the test fold
-shape the principal axes. Unsupervised leakage is still leakage. randmlp
-needs no such care -- a random projection never looks at the data.
-
-EXPECT THE GATE-INPUT PROBLEM TO RECUR. The randmlp run showed setting 4
-degrading in almost every cell while setting 3, which mixes but does not READ the
-embedding, improved in 8/12 -- the gate struggles to learn from 128
-dimensions with no semantic structure. PCA axes are not aligned-space
-coordinates either, so pair this with --no-emb-in-gate to separate "a
-stronger sEHR side helps the fusion" from "the gate cannot use the
-embedding as an input".
-
-Why the option exists: v_ehr_post scores BELOW v_ehr_pre on HF and eMACE, so
-the fusion is built on an sEHR vector weaker than the one available. randmlp
-holds the bottleneck and the normalisation fixed while removing only the
-alignment TRAINING, which both measures what that training contributed and
-supplies a mixer input that does not depend on it.
-
-    adds  0c_EHR_randmlp                     (= the mixer's alpha=0 endpoint)
-          1br_EHR_randmlp_plus_gate_scalars  (what setting 4 must beat)
-
-The PPG side is identical in both modes, so the sweep's alpha=1 endpoint must
-equal 2_PPG_post in BOTH runs -- checked automatically at the end.
-
-LIMITATION, and it is not a footnote: with a random sEHR projection the two
-128-d blocks no longer share a learned coordinate system, so the mixer's
-shared-w constraint (train_probe_regularized.py:150-156) loses its
-justification. The mixture remains a well-defined restriction of the
-concatenated probe, but not a principled one. alpha values from a randmlp run
-are NOT comparable to an aligned run's -- the gate's input distribution
-changed too.
-
-SETTING 4's REGULARISATION  (--gate-wd-fix)
-------------------------------------------
-Setting 4 as originally written has three coupled faults, all found while
-fixing the same ones in score_fusion.py:
-
-    weight decay hit the gate BIAS, which encodes the baseline alpha, so alpha
-    was pulled toward sigmoid(0) = 0.5 -- not a neutral value, just an artifact
-    of the parametrisation, and well above the alpha the selection actually
-    prefers;
-
-    one wd covered the gate AND the 128-d head, so a single knob controlled
-    both "how much does alpha vary" and "how much is the classifier shrunk";
-
-    WEIGHT_DECAY_GRID stops at 1e-1, which never flattens alpha -- its
-    fold-to-fold spread is undiminished at the top of that grid -- so setting
-    4 could never degenerate to setting 3 and
-    "the learned gate loses to a fixed alpha" was not separable from "the gate
-    was never allowed to stop varying". Every AF fold selected the grid edge.
-
---gate-wd-fix repairs all three: bias excluded, head held at DEFAULT_WD so the
-selected wd has ONE meaning, grid widened to 10. OFF by default, so an
-unflagged run reproduces the published setting-4 numbers exactly; with it on
-the output filename gains _gatefix and nothing is overwritten.
-
-Expect it to close a fairness gap, not to win: setting 4's alpha=0 endpoint is
-1_EHR_post, which sits below 0a_EHR_pre on HF and eMACE, and no amount of
-regularisation fixes a representation deficit.
-
-Usage:
-    python gated_fusion.py
-    python gated_fusion.py --gate-wd-fix --disease AF
-    python gated_fusion.py --no-emb-in-gate
-    python gated_fusion.py --emb-only-gate
-    python gated_fusion.py --gate-hidden 16
-    python gated_fusion.py --ehr-source randmlp --rand-seed 0
-"""
+"""GATED FUSION -- post-discharge downstream cohort."""
 import os
 
 import argparse
@@ -280,18 +149,7 @@ def GATE_INPUT_TAG(args):
     return ''
 
 class ConvexMixer(BaseEstimator, TransformerMixin):
-    """fused = (1 - alpha) * v_ehr + alpha * v_ppg.
-
-    Input X is [v_ehr | v_ppg]; alpha IS the PPG weight, so alpha=0 reproduces
-    the EHR_post probe exactly and alpha=1 the PPG_post probe exactly. Placed
-    AFTER the scaler so both blocks are standardised first -- the mixture is
-    then a restriction of the concatenated probe with the two coefficient
-    vectors constrained parallel.
-
-    reg.FusionMixer computes (ve + a*vp)/(1+a) instead, where a=2 means a PPG
-    weight of 2/3, so its grid never reaches pure PPG and its alpha is not
-    comparable to the one swept here.
-    """
+    """fused = (1 - alpha) * v_ehr + alpha * v_ppg."""
     def __init__(self, alpha=0.0, dim=128):
         self.alpha = alpha
         self.dim = dim
@@ -305,61 +163,7 @@ class ConvexMixer(BaseEstimator, TransformerMixin):
 
 
 def build_pca_estimator(n_components=128, whiten=False):
-    """StandardScaler -> PCA(128) -> the SAME L2 logistic every other row uses.
-
-    WHAT THIS ISOLATES
-    ------------------
-    v_ehr_post (128, aligned) sits below v_ehr_pre (320) on HF and eMACE. Two
-    candidate causes were confounded: 128 dimensions may not hold
-    the information, or the alignment may have kept the wrong 128. This splits
-    them, because PCA is the best LINEAR 128-d compression of the same input:
-
-        0e ~ 0a   128 dimensions suffice, so the aligned projection lost the
-                  useful directions rather than the budget -- and a better
-                  objective could recover them.
-        0e << 0a  the budget itself is binding; no 128-d projection will do,
-                  and fusion should use the 320-d vector (which is what
-                  score_fusion.py already does).
-
-    WHY PCA RATHER THAN A TASK-TRAINED PROJECTION
-    ---------------------------------------------
-    A supervised 320->256->128 mirror of mlp_s is ~115k parameters against
-    1480 rows and 52-155 positives, so losing to 0a would be uninterpretable --
-    overfitting and an insufficient budget look identical. PCA is unsupervised,
-    has no such capacity, and never touches the label, so a deficit here can
-    only be the dimension. It answers the question that was actually asked.
-
-    NESTING, AND WHICH DIRECTION IT RUNS
-    ------------------------------------
-    Any linear function of the top-128 PCs is a linear function of the 320
-    inputs, so 0e's hypothesis class is CONTAINED in 0a's -- the opposite
-    direction from the concat rows, where the new model is the larger one. 0e
-    therefore cannot beat 0a on the training objective, and 0a - 0e on the
-    outer folds is what the 192 discarded components were worth.
-
-    THE READING IS ASYMMETRIC -- this matters
-    -----------------------------------------
-    PCA maximises VARIANCE, not label-relevance. It is the best linear 128-d
-    compression in the reconstruction sense, not the discriminative one. So:
-
-        0e ~ 0a   CONCLUSIVE. Even a label-blind compression keeps what the
-                  probe needs, so 128 dimensions are not the constraint and
-                  the aligned projection lost the useful directions.
-        0e << 0a  AMBIGUOUS. Either 128 dimensions really are too few, OR PCA
-                  kept high-variance directions that happen not to carry the
-                  label. A supervised 320->128 projection could still beat it.
-
-    Verified on synthetic data where the label depended on 5 of 320 iid
-    Gaussian dimensions: there PCA-128 fell well short of the full 320, purely
-    because those 5 dimensions were not the high-variance ones. Real
-    BERT embeddings are unlikely to be that adversarial -- the signal is
-    probably spread over high-variance directions -- but the possibility is
-    why a deficit here does NOT close the question on its own.
-
-    No leakage: PCA sits inside the Pipeline, so it is fitted on the training
-    part of each fold only. svd_solver='full' for determinism -- the default
-    would pick the randomized solver at this shape.
-    """
+    """StandardScaler -> PCA(128) -> the SAME L2 logistic every other row uses."""
     return Pipeline([
         ('sc', StandardScaler()),
         ('pca', PCA(n_components=n_components, whiten=whiten,
@@ -386,48 +190,7 @@ SWEEP_ALPHA_GRID = [float(round(a, 2)) for a in np.linspace(0.0, 1.0, 21)]
 # Randomly-initialised sEHR projection  (--ehr-source randmlp)
 # ══════════════════════════════════════════════════════════════════════════
 def random_project_ehr(VE_pre, seed):
-    """v_ehr_pre (320) -> L2(mlp_s_random(v_ehr_pre)) (128).
-
-    WHAT THIS IS FOR
-    ----------------
-    v_ehr_post scores BELOW v_ehr_pre on HF and eMACE, so the fusion's sEHR
-    side is weaker than the sEHR representation available. Three things change
-    between pre and post -- the 320->128 bottleneck, the row-wise L2, and the
-    alignment training -- and the probe cannot separate them. Replacing only
-    the TRAINING with a random draw holds the other two fixed, so this variant
-    both (a) measures what alignment training contributed to the sEHR side and
-    (b) supplies a 128-d sEHR vector for the mixer that does not depend on it.
-
-    Architecture is copied bit-for-bit from the mlp_s that produced
-    v_ehr_post_mlp (identify/extract_feature.py:186-193), then L2-normalised
-    exactly as extract_feature.py:437 does. Any deviation would reintroduce the
-    dimensional or normalisation confound this variant exists to remove.
-
-    IMPLEMENTATION NOTES, each of which is load-bearing:
-
-    eval()          Dropout(0.1) would otherwise zero 10% of the hidden units
-                    at random on every call. That is noise, not a fixed random
-                    projection; in eval mode Dropout is the identity.
-
-    fork_rng        seeding the GLOBAL torch RNG here would shift the stream
-                    that run_setting4 later draws its gate initialisation from,
-                    so every setting-4 number would move for a reason having
-                    nothing to do with the sEHR side. Forking keeps the global
-                    stream untouched, and the baseline run reproduces bit-for-
-                    bit.
-
-    default init    nn.Linear's Kaiming-uniform default is exactly the
-                    distribution the trained mlp_s started from, so this is
-                    that same network before it saw data. Hand-rolled init
-                    would answer a different question.
-
-    CAVEAT for the writeup: with a random sEHR projection the two 128-d blocks
-    no longer share a learned coordinate system, so the mixer's shared-w
-    constraint (train_probe_regularized.py:150-156) loses its justification --
-    coordinate j of the two vectors are unrelated. The mixture is still a
-    well-defined restriction of the concatenated probe, but it is no longer a
-    principled one. This belongs in the limitations, not in a footnote.
-    """
+    """v_ehr_pre (320) -> L2(mlp_s_random(v_ehr_pre)) (128)."""
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(seed)
         mlp = nn.Sequential(
@@ -542,16 +305,7 @@ def build_scalar_matrix(sub):
 
 
 def assign_folds(both, disease):
-    """One fold per admission, patient-grouped, 365-day-status stratified.
-
-    Stratification uses the disease-specific 365-day STATUS, not just positives:
-        0 = usable negative
-        1 = positive
-        2 = censored (NaN)
-
-    This keeps NaN distinct from a negative while retaining the old design of
-    assigning folds once at admission level before long-format expansion.
-    """
+    """One fold per admission, patient-grouped, 365-day-status stratified."""
     groups = both['patient_id'].astype(str).to_numpy()
     s365 = pd.to_numeric(both[label_col(disease, 365)], errors='coerce')
 
@@ -612,29 +366,7 @@ class GatedFusion(nn.Module):
 
 
 def _split_param_groups(model, wd, gate_wd_fix, wd_head=None):
-    """Optimizer param groups for one (wd) candidate.
-
-    Default (gate_wd_fix=False) reproduces the original exactly: a single
-    weight decay over every parameter.
-
-    With the fix, three groups:
-
-      gate weights  wd          the quantity actually being selected --
-                                how much alpha varies with its inputs
-      gate biases   0.0         the bias sets the BASELINE alpha; decaying it
-                                pulls alpha toward sigmoid(0) = 0.5, which is
-                                not a neutral value but an artifact of the
-                                parametrisation, and above the alpha the
-                                selection actually prefers.
-      head          DEFAULT_WD  held FIXED rather than selected, so the
-                                selected wd has one meaning instead of two.
-
-    The head must keep a real penalty for the degenerate endpoint to be
-    meaningful: at the top of the wide grid the gate weights vanish and alpha
-    becomes constant, which should reproduce setting 3 -- a constant-alpha
-    mixture with a working head. Letting the selected wd hit the head too
-    would crush the head at the same time and leave no model at all.
-    """
+    """Optimizer param groups for one (wd) candidate."""
     if not gate_wd_fix:
         return [{'params': list(model.parameters()), 'weight_decay': wd}]
     gw = [p for n, p in model.gate.named_parameters() if not n.endswith('bias')]
@@ -674,16 +406,7 @@ def _train_once(ze_t, zp_t, xg_t, y_t, y, h_idx, tr_i, va_i, scorable,
                 dim, gate_dim, hidden, seed, wd, lr, gate_wd_fix=False,
                 wd_head=None, n_epochs=None, return_epoch=False,
                 eval_every=1, make_model=None, make_groups=None):
-    """One training run at fixed (wd, lr). Returns (model, best_val_auroc).
-
-    best_val_auroc is None when there is no validation split, in which case the
-    fixed epoch budget runs and the final model is returned. That value is what
-    ranks candidates, so a fold returning None cannot select and the caller
-    falls back to the defaults.
-
-    The seed is applied here rather than by the caller so every candidate starts
-    from the same initialisation and differs only by the hyperparameter.
-    """
+    """One training run at fixed (wd, lr)."""
     # make_model / make_groups let a caller substitute a different module and
     # its own parameter-group split while reusing this loop -- the early
     # stopping, the eval_every schedule, the epoch accounting. Duplicating the
@@ -763,30 +486,7 @@ def _train_once(ze_t, zp_t, xg_t, y_t, y, h_idx, tr_i, va_i, scorable,
 
 def fit_gate(ze, zp, xg, y, groups, h_idx, dim, gate_dim, hidden, seed,
              gate_wd_fix=False):
-    """Joint fit of g and head, with (weight_decay, lr) chosen on the inner split.
-
-    Returns (model, used_early_stopping, chosen_wd, chosen_lr).
-
-    ONE INNER SPLIT, TWO JOBS
-    -------------------------
-    The split is made once and every candidate trains against it, so the same
-    held-out patients both stop each run and rank the runs against each other --
-    the structure GridSearchCV uses for (C, alpha) in the sklearn settings.
-    Selecting on the outer test fold would be the same error as reading a swept
-    alpha off the test set.
-
-    Input rows are already restricted to NON-CENSORED disease x horizon rows.
-    Positives are counted as distinct patients, not long-format rows, because
-    the four horizon copies of one admission are not four independent cases.
-    Validation AUROC is computed per horizon and averaged: a pooled AUROC would
-    rank a 365-day positive against a 30-day negative and be dominated by
-    whichever horizon has the highest event rate.
-
-    When no usable split exists there is no validation signal, so nothing can be
-    selected AND nothing can be stopped: the fixed epoch budget runs at
-    DEFAULT_WD / DEFAULT_LR and the fold is counted. Stopping or selecting on
-    the training rows would pick the most overfitted candidate.
-    """
+    """Joint fit of g and head, with (weight_decay, lr) chosen on the inner split."""
     pos_patients = np.unique(groups[y == 1])
     n_pos_patients = len(pos_patients)
     use_es = n_pos_patients >= MIN_POS_FOR_EARLYSTOP
@@ -858,18 +558,7 @@ def fit_gate(ze, zp, xg, y, groups, h_idx, dim, gate_dim, hidden, seed,
 
 
 def _pf(vals):
-    """Per-fold values as a CSV string, matching run_cv's auroc_per_fold.
-
-    Setting 4 and its diagnostic rows are the ONLY ones this script builds by
-    hand, so without this they were the only rows in the table missing the
-    per-fold columns -- and they are precisely the rows the --ehr-source modes
-    exist to compare. assign_folds depends on the disease and RANDOM_SEED
-    alone, never on --ehr-source, so setting 4 in an aligned run and setting 4
-    in a pca run are scored on the SAME outer folds and can be differenced
-    fold by fold. A mean-only comparison throws that pairing away: the
-    fold-to-fold spread is largely shared between the two runs, so the sd of
-    the per-fold difference is far smaller than the difference of the sds.
-    """
+    """Per-fold values as a CSV string, matching run_cv's auroc_per_fold."""
     return ','.join(f'{v:.6f}' for v in vals)
 
 
@@ -883,11 +572,7 @@ def ranks(s):
 
 # ══════════════════════════════════════════════════════════════════════════
 def horizon_valid_folds(both, fold_of, disease):
-    """Global fold ids that are trainable and scorable for each horizon.
-
-    NaN labels are excluded only for the corresponding horizon. A fold is valid
-    when the NON-CENSORED training and test slices both contain classes 0 and 1.
-    """
+    """Global fold ids that are trainable and scorable for each horizon."""
     valid = {}
     for horizon in HORIZONS:
         s = pd.to_numeric(
@@ -930,11 +615,7 @@ def run_setting4(
     args,
     VE_pre=None,
 ):
-    """One shared learned-alpha model across four horizons for one disease.
-
-    Censoring is row-level: a NaN at one horizon removes only that long-format
-    row from fitting/scoring. The admission remains available at other horizons.
-    """
+    """One shared learned-alpha model across four horizons for one disease."""
     dim = VE.shape[1]
     hz_vals = np.array([HORIZON_DAYS[h] / 365.0 for h in HORIZONS])
     Y = np.stack(

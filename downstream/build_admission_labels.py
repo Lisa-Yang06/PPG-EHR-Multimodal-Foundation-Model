@@ -1,71 +1,4 @@
-"""
-Rebuild the sample set from the admission table, label it, and count how much
-of it carries PPG. Stages 1-3.5 of the plan, in one run.
-
-WHAT CHANGED AND WHY
---------------------
-The previous sample set (1638 rows) was built by treating every day-floored
-DIAGNOSIS-CODE timestamp as an "admission", then dropping every admission on or
-after the patient's first MACE onset. Both parts are now wrong for this task:
-
-  the anchor      a day with a diagnosis code is not necessarily a
-                  hospitalisation, and the new label window opens at
-                  dischtime, which such a day does not have. The stay table
-                  gives real admissions with real admittime/dischtime, so
-                  hadm_id becomes the sample id and nothing has to be inferred.
-
-  the drop rule   "admission_day >= onset_day -> DROP" existed because the old
-                  target was time-to-FIRST-onset, and post-onset rows are not
-                  prediction. The new label is "is this disease coded after
-                  this stay", which is perfectly well defined afterwards -- and
-                  the dropped rows are exactly the follow-up admissions of
-                  patients who already have cardiovascular disease, i.e. where
-                  the positives are densest. Removing the rule is the point of
-                  this rebuild.
-
-LABEL
------
-    label(admission, disease, N)
-        = 1   if any code of that disease falls in (dischtime, dischtime + N]
-        = NA  if no such code AND the patient died on or before dischtime + N
-        = 0   otherwise
-
-A death censors only when the outcome is otherwise unknown. If the code already
-appeared inside the window the event is observed and the label stays 1 whatever
-happened next; censoring an observed positive would discard the scarcest thing
-in this dataset.
-
-Death comes from dod, not from the stay table's deathtime: deathtime is
-populated only for deaths DURING that stay, so it is empty for exactly the
-deaths that matter here -- discharged alive, dies three weeks later. deathtime
-only fills gaps dod leaves.
-
-STAGE 3.5 IS THE DECISION POINT
--------------------------------
-PPG availability is computed here directly from the parquet window timestamps
-rather than waiting for feature extraction, because it is cheap and it decides
-whether extraction is worth running at all. The previous cohort had 953
-PPG-carrying admissions and 3/7/9/17 positives among them, which is why nothing
-downstream could be resolved. If removing the drop rule does not move that
-number materially, the expensive stage should not be started.
-
-WHAT IS NOT HANDLED
--------------------
-Loss to follow-up: an admission whose patient has no coded activity after
-dischtime + N is scored 0, though the correct answer is "not observed". MIMIC
-has no follow-up-end field. The effect is one-directional -- 0s at long
-horizons are contaminated, so positive rates there are underestimates, more so
-for patients who rarely present.
-
-Out-of-hospital death recording is itself incomplete (III via a social-security
-index, IV via state records), so "no dod" is not proof of survival. Coverage is
-reported; the limitation cannot be closed in code.
-
-Usage:
-    python build_admission_labels.py
-    python build_admission_labels.py --no-test-only     # ignore the split
-    python build_admission_labels.py --skip-ppg         # stages 1-3 only
-"""
+"""Rebuild the sample set from the admission table, label it, and count how much of it carries PPG."""
 import os
 import sys
 
@@ -217,13 +150,7 @@ def patient_codes(pid, db, lookup):
 
 
 def ppg_span(pid, dataset):
-    """(first, last) PPG window timestamp for a patient, or None.
-
-    Read straight from the parquet's window_start_time column -- no block
-    assembly, no signal decoding. Availability per admission only needs to know
-    whether any window falls inside the stay, and answering that here avoids
-    running feature extraction before knowing whether it is worth running.
-    """
+    """(first, last) PPG window timestamp for a patient, or None."""
     p = Path(PPG_DIR[dataset]) / pid / PPG_PARQUET
     if not p.exists():
         return None

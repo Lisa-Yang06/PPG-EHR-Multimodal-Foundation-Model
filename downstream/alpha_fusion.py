@@ -1,106 +1,4 @@
-"""
-PER-HORIZON LEARNED-ALPHA EMBEDDING FUSION -- post-discharge cohort.
-
-WHAT THIS EXISTS TO ANSWER
---------------------------
-Does an embedding-level fusion of sEHR and PPG beat the plain sEHR probe on
-the ORIGINAL 320-d BERT vector (0a_EHR_pre), when the two are given exactly
-the same shot?
-
-gated_fusion.py's setting 4 could not answer it. Two structural gaps:
-
-  1  its classifier was a torch Linear trained at a fixed epoch budget, and
-     4b -- the SAME gate, the SAME per-admission alpha, only the classifier
-     swapped for the inner-CV L2 logistic that 0a uses -- beat it in every
-     cell, by a wide margin. The head, not the representation, was binding.
-
-  2  setting 4 fits ONE model across the four horizons while 0a fits four
-     independent ones. A shared model also sees all four horizons' labels,
-     so at 30d it trains on information 0a never gets. Not test leakage, but
-     not the same contest either.
-
-Here everything is per horizon, end to end: its own PCA, its own gate, its
-own classifier, its own C. Nothing is shared across horizons and the gate has
-no horizon input -- inside one horizon that input is constant, so it would
-survive StandardScaler only as a zeroed column and a wasted parameter.
-
-THE sEHR SIDE
--------------
-PCA(128) of v_ehr_pre, block-scaled, fitted inside the fold. 0e matches 0a in
-every cell, so this compression is free and the fusion is not being handed a
-degraded sEHR side the way v_ehr_post is -- the aligned 128-d vector sits
-below 0a_EHR_pre, worst on eMACE. Not whitened: whitening measurably cost
-AUROC in every cell (see gated_fusion.py).
-
-WHAT MAKES THE COMPARISON FAIR, AND THE ONE THING THAT STILL DIFFERS
---------------------------------------------------------------------
-Shared with A320_sEHR_pre: the outer folds (assign_folds, per disease, patient
--grouped, 365d-status stratified), the per-horizon censoring, the classifier
-family, C_GRID, and the inner 3-fold StratifiedGroupKFold that selects C.
-
-Still different, and it cannot be removed: the gate is fitted by gradient
-descent with its own single inner split for early stopping and (wd, lr)
-selection, while every sklearn row selects C by 3-fold inner CV. Two
-selection protocols, same outer folds. E's advantage is that it gets to see
-the PPG block at all; that is the hypothesis, not a confound.
-
-GATE SIZE IS THE BINDING CONSTRAINT, and it decides which variant can work
-------------------------------------------------------------------------
-Per horizon there are ~1480 training rows and 42-124 training positives.
-
-    gate input          params    verdict
-    4 scalars              5      fits comfortably
-    ze + zp + scalars    261      261 parameters against ~42 positives at 30d
-
-So --gate-input scalars is the variant with a real chance, and it is the one
-to read. The emb variant is run as the control: the randmlp run already showed
-setting 4 degrading in almost every cell while setting 3 -- which MIXES the
-embedding but does not READ it -- improved in 8/12, i.e. the gate struggles to
-learn from 128 dimensions with no semantic structure. This tests that again
-under a budget where it is even less plausible.
-
-THE ROWS
---------
-    A320_sEHR_pre         v_ehr_pre (320d)          <- the target to beat (= 0a)
-    A_sEHR_pca128         ze                        <- the mixture's alpha=0 end
-    B_PPG_post            zp                        <- the mixture's alpha=1 end
-    F_sEHR_plus_scalars   [ze | scalars]            <- same side info, no fusion
-    C_concat              [ze | zp]                 <- the mixture UNRESTRICTED
-    D_fixed_alpha         (1-a)ze + a*zp, a by CV   <- did LEARNING alpha help?
-    E_learned_alpha       a_i = sigmoid(g(x_i))     <- the proposal
-    E_sklearnhead         E's gate, E's alpha, sklearn classifier -- the
-                          control that says whether one end-to-end scheme is
-                          enough
-
-C_concat is not decoration. The convex mixture is the concatenated probe with
-the two coefficient vectors constrained PARALLEL:
-
-    w . ((1-a) ze + a zp)  =  [ (1-a)w | a w ] . [ ze | zp ]
-
-so every fixed mixture lies inside C_concat's hypothesis class. That nesting
-is about the CLASS, not about the test AUROC -- C_concat carries 256 free
-coefficients against 42-124 training positives, and the same function is
-penalised differently in the two models (L2 costs ((1-a)^2 + a^2)||w||^2 there
-against ||w||^2 here), so C_concat scoring BELOW D_fixed_alpha is entirely
-possible and is itself the finding: the constraint is buying generalisation.
-Read it the other way too -- if C_concat beats E, the recommendation is plain
-concatenation and the gate buys nothing. Either way it has to be
-measured before the gate is proposed, not after.
-
-D_fixed_alpha is the control that isolates the LEARNING. E and D mix the same
-two blocks with the same classifier; only "alpha per admission, by gradient"
-versus "one alpha, by inner CV" differs.
-
-E's stage-2 C is selected on fused training rows whose alpha came from a gate
-early-stopped on a fraction of those same rows; the test fold is untouched.
---oof-alpha rotates the inner split so every training row gets an alpha from a
-gate that never saw it, at k times the stage-1 cost. Off by default.
-
-Usage:
-    python alpha_fusion.py --disease AF
-    python alpha_fusion.py --disease AF --gate-input emb
-    python alpha_fusion.py --disease AF --oof-alpha
-"""
+"""PER-HORIZON LEARNED-ALPHA EMBEDDING FUSION -- post-discharge cohort."""
 import os
 
 import argparse
@@ -142,7 +40,10 @@ from gated_fusion import (
     build_scalar_matrix, ConvexMixer,
 )
 
-N_COMPONENTS = 128
+from grids import (  # the shared search grids, see grids.py
+    N_COMPONENTS, WD_GRID, WD_GATE_GRID, WD_HEAD_GRID,
+    LR_GRID_E, MAX_RHO, N_INNER_E,
+)
 # D_fixed_alpha's convex grid. Kept identical to ADAPTER_ALPHA_GRID so that
 # D and G_adapter_fixed_alpha differ ONLY in the sEHR side -- both are "convex
 # mixture with alpha chosen by inner CV", and a 0.1 grid against a 0.05 one
@@ -172,27 +73,7 @@ N_EPOCHS_DEFAULT = 300
 
 
 class BlockPrep(BaseEstimator, TransformerMixin):
-    """[v_ehr_pre | v_ppg_post | extra] -> the standardised blocks, per fold.
-
-        ze = PCA(128) of StandardScaler(v_ehr_pre), divided by sqrt of the mean
-             retained eigenvalue
-        zp = StandardScaler(v_ppg_post)
-        ex = StandardScaler(extra)
-
-    Everything is fitted here rather than up front so that it lands inside the
-    Pipeline and therefore inside each outer fold. PCA reads the feature
-    matrix, so a cohort-wide fit would let the test fold shape the principal
-    axes -- unsupervised, but still leakage.
-
-    The block scaling is ONE scalar. Relative variance between components is
-    untouched (whitening destroys it, at a measured cost in AUROC), while the
-    block's mean column variance becomes 1, matching what StandardScaler leaves
-    on the PPG side. That is what makes alpha a block-level weight rather than
-    an accident of the two blocks' scales.
-
-    svd_solver='full' for determinism -- the default picks the randomized
-    solver at this shape.
-    """
+    """[v_ehr_pre | v_ppg_post | extra] -> the standardised blocks, per fold."""
 
     def __init__(self, ehr_dim=320, ppg_dim=128, n_components=N_COMPONENTS,
                  out='both'):
@@ -264,13 +145,7 @@ def est_block(out):
 
 
 def est_mixed():
-    """BlockPrep -> ConvexMixer -> logistic. 'mix' is the name run_cv addresses.
-
-    The mixer sits AFTER the block preparation, so the mixture is a restriction
-    of the C_concat probe with the two 128-d coefficient vectors constrained
-    parallel -- which is why C_concat >= D_fixed_alpha is structural rather
-    than empirical.
-    """
+    """BlockPrep -> ConvexMixer -> logistic."""
     return Pipeline([
         ('prep', BlockPrep(out='both')),
         ('mix', ConvexMixer(dim=N_COMPONENTS)),
@@ -283,12 +158,7 @@ def _pf(vals):
 
 
 def select_C(F_tr, y_tr, g_tr):
-    """The same C selection every sklearn row in this table uses.
-
-    Returns (fitted_estimator, C). Falls back to DEFAULT_C when the fold holds
-    too few positives for a 3-fold inner split, exactly as run_cv does, so E is
-    not quietly given a selection the baselines were denied.
-    """
+    """The same C selection every sklearn row in this table uses."""
     if int(y_tr.sum()) >= reg.MIN_POS_FOR_INNER_CV:
         try:
             inner = StratifiedGroupKFold(n_splits=reg.N_FOLDS_INNER,
@@ -323,53 +193,6 @@ def select_C(F_tr, y_tr, g_tr):
 # sqrt(n) scaling had only ever been measured at one width. Here the grid just
 # spans four decades, inner CV picks, and the log reports whether any axis was
 # selected at an edge -- widen and rerun if so.
-# ONE decay grid for every weight-decay axis in this file -- gate, head, and
-# the representation side (adapter / MLP / projection). They were different
-# once, and the reason was the residual: an adapter CAN be driven to zero, at
-# which point the model falls back on the frozen aligned vector, so very
-# strong decay is a meaningful endpoint there and the grid was pushed up to
-# 1..100. That argument does not survive contact with H_mlp, M_ or N_mlp,
-# none of which is a residual: driving their projection to zero does not turn
-# a correction off, it erases the representation. Keeping the encoder axis
-# two decades above the head axis was therefore an assumption, not a result.
-#
-# 30 is the ceiling, not 100, and the constraint is rho. The guard
-# is lr*wd <= MAX_RHO with each group's OWN lr: head and gate run at 0.01 so
-# they stop at 30, the encoder runs at 0.003 so it could reach 100. A shared
-# grid ending at 100 would be reachable by the encoder and not by the head --
-# the same ragged-grid problem --lr-adapter was added to remove.
-#
-# If a residual genuinely needs more decay than a head does, the way to learn
-# that is to watch G_adapter pin itself to 30 here. That is evidence. The old
-# split assumed the answer.
-WD_GRID = [1e-2, 1e-1, 1.0, 10.0, 30.0]
-WD_GATE_GRID = WD_GRID
-WD_HEAD_GRID = WD_GRID
-# A tenth was added because lr sat at the grid edge in every fold of several
-# cells, and then REMOVED because a later run showed it was harmful. rho =
-# lr*wd caps the per-step shrinkage but does nothing about total travel: a
-# larger rate paired with a smaller decay shrinks exactly as fast per step
-# while taking proportionally larger gradient steps, so the adapter runs much
-# further before decay catches it. The cells that lost the most AUROC were
-# precisely the ones that selected the largest rate, and their diagnostics
-# show it: the adapter's output norm dwarfs the frozen vector it corrects and
-# the cosine to that vector collapses, i.e. the pretrained representation has
-# been overwritten rather than adjusted. A grid edge being selected is a
-# request to widen; it is not a promise that widening helps.
-LR_GRID_E = [3e-3, 1e-2, 3e-2]
-
-# AdamW's decoupled decay multiplies the old weight by (1 - lr*wd) every step,
-# so lr*wd is the per-step shrinkage and it is what has to stay sane -- the
-# same wd means very different things at lr=3e-3 and lr=3e-2. Above 1 the
-# multiplier goes NEGATIVE (the weight flips sign each step) and above 2 it
-# also grows; gated_fusion's MAX_LR_TIMES_WD=2 only rules out the second,
-# which is the divergence boundary, not a sensible regularisation range.
-# 0.3 means at most a 30% cut per step. Nothing in the grid above trips it --
-# the largest product is 3e-2 * 10 = 0.3 exactly -- so it is a guard for when
-# the grid is widened, not an active filter today.
-MAX_RHO = 0.3
-
-N_INNER_E = 3
 
 
 def candidates():
@@ -381,34 +204,12 @@ def candidates():
 
 
 def _gate_matrix(ze, zp, M, gate_input):
-    """scalars: 4 columns. emb: + both 128-d blocks. No horizon column --
-    inside one horizon it is constant, so StandardScaler would emit zeros and
-    the gate would carry a parameter that cannot move the loss."""
+    """scalars: 4 columns."""
     return M if gate_input == 'scalars' else np.hstack([ze, zp, M])
 
 
 def _pack(X, M, y, i_tr, i_va, gate_input):
-    """Prepare ONE inner fold, fitting every data-driven transform on i_tr only.
-
-    This is the whole reason the selection loop lives here instead of calling
-    gated_fusion.fit_gate: BlockPrep (StandardScaler + PCA) and the gate's
-    scaler have to be fitted INSIDE the inner split, not on the full outer-
-    training fold before splitting. Fitting first and splitting after lets the
-    inner-validation rows shape the principal axes, which is what fitting
-    inside the split exists to prevent.
-
-    It also matters for symmetry, which is the point of this whole script:
-    every sklearn row here carries BlockPrep as a Pipeline step, so
-    GridSearchCV already refits it per inner fold. Leaving E on the looser
-    protocol would put the two sides of the comparison on different standards.
-
-    Returned as one concatenated array plus index arrays, because that is the
-    interface _train_once takes. None when the validation slice is single-
-    class and therefore cannot score.
-
-    The prep does NOT depend on the hyperparameters, so this runs once per
-    inner fold and all candidates share it.
-    """
+    """Prepare ONE inner fold, fitting every data-driven transform on i_tr only."""
     prep = BlockPrep(out='both').fit(X[i_tr])
     ze_a, zp_a, _ = prep.blocks(X[i_tr])
     ze_b, zp_b, _ = prep.blocks(X[i_va])
@@ -435,24 +236,7 @@ def _pack(X, M, y, i_tr, i_va, gate_input):
 
 
 def select_hparams(X, M, y, groups, gate_input, seed, epochs, eval_every=1):
-    """3-fold inner CV over the joint grid. Returns (best_row, all_rows).
-
-    Every candidate trains once per inner fold and is ranked by the MEAN of
-    its validation AUROCs -- the same protocol GridSearchCV gives C on every
-    sklearn row in this table. Ranking 48 candidates on a single 25% split
-    would be argmax over 48 numbers each computed from 10-30 positives, which
-    mostly selects whichever candidate got the lucky split.
-
-    best_epoch is the MEDIAN of the three folds' best epochs, not the mean:
-    one fold running to the budget because of noise should not drag the refit
-    length with it.
-
-    Returns (None, []) when no inner fold can score -- too few positive
-    patients to split, or every validation slice single-class. The caller then
-    falls back to fixed hyperparameters AND COUNTS THE FOLD, because a fold
-    that quietly ran the full budget with no early stopping and no selection
-    is exactly the kind of thing that should not be invisible.
-    """
+    """3-fold inner CV over the joint grid."""
     pos = np.unique(groups[y == 1])
     packs = []
     if len(pos) >= N_INNER_E:
@@ -602,13 +386,7 @@ def run_learned_alpha(X, M, y, groups, folds, gate_input, args):
 
 
 def oof_alpha(X, M, y, groups, gate_input, seed, wd_g, wd_h, lr, ep):
-    """Out-of-fold alpha for the training rows, at the SELECTED hyperparameters.
-
-    Only affects E_sklearnhead's C selection: without it, alpha on the
-    training rows comes from a model that was fitted on those same rows. The
-    outer test fold is untouched either way, so both E rows' reported AUROC is
-    clean regardless. Costs one extra training run per inner fold.
-    """
+    """Out-of-fold alpha for the training rows, at the SELECTED hyperparameters."""
     a = np.full(len(y), 0.5, dtype=np.float64)
     pos = np.unique(groups[y == 1])
     if len(pos) < N_INNER_E:
@@ -716,20 +494,7 @@ ADAPTER_ALPHA_GRID = [round(0.05 * i, 2) for i in range(21)]
 
 
 class ResidualAdapter(nn.Module):
-    """320 -> r -> 128, zero-initialised at the output.
-
-    Zero-init on `up` alone (not `down`) is the LoRA arrangement. At step 0 the
-    adapter contributes exactly nothing, so the model starts from the
-    pretrained aligned vector; the gradient w.r.t. `down` is zero at that
-    instant and becomes non-zero as soon as `up` leaves the origin. Zeroing
-    both would freeze the adapter permanently.
-
-    r=16 is 320*16 + 16*128 = 7168 weights against 42-124 training positives.
-    That is small for an MLP and still large for this cohort, which is why the
-    output is a RESIDUAL on a frozen vector rather than a replacement: the
-    model cannot do worse than the frozen aligned representation by leaving
-    the adapter at zero, and early stopping can keep it there.
-    """
+    """320 -> r -> 128, zero-initialised at the output."""
 
     def __init__(self, in_dim=320, rank=16, out_dim=128, zero_init=True):
         super().__init__()
@@ -749,17 +514,7 @@ class ResidualAdapter(nn.Module):
 
 
 class AdaptedFusion(nn.Module):
-    """Adapter + optional gate + head, with GatedFusion's forward signature.
-
-    `ez` arrives as [v_ehr_pre (pre_dim) | z_E_post (dim)] so that _train_once
-    -- which passes exactly three tensors -- can drive this module unchanged.
-
-    alpha_fixed=None gives the learned gate; a float freezes alpha, which
-    turns this into the fixed-mixture variant and, at 0.0, into the
-    adapter-only control. Every run so far has had a fixed alpha beat the
-    learned one, so testing the adapter under BOTH is what separates "the
-    adapter helps" from "the gate hurts".
-    """
+    """Adapter + optional gate + head, with GatedFusion's forward signature."""
 
     def __init__(self, pre_dim, dim, gate_in_dim, rank, alpha_fixed=None,
                  use_base=True):
@@ -791,9 +546,7 @@ class AdaptedFusion(nn.Module):
 
 
 def adapter_groups(wd_adapter, lr_adapter=None):
-    """Six groups. Every bias is exempt, and the adapter never shares a decay
-    with the gate: one controls how far the representation may move from the
-    pretrained one, the other how much alpha may vary. Held apart on purpose."""
+    """Six groups."""
     def f(model, wd, wd_head):
         aw = [p for n, p in model.adapter.named_parameters()
               if not n.endswith('bias')]
@@ -821,17 +574,7 @@ def adapter_groups(wd_adapter, lr_adapter=None):
 
 
 def _adapter_pack(Xa, M, y, i_tr, i_va, gate_input, pre_dim, dim):
-    """One inner fold for the adapter rows.
-
-    Xa is [v_ehr_pre | v_ehr_post | v_ppg_post]. Only v_ehr_pre is scaled, and
-    its scaler is fitted on i_tr alone -- same discipline as BlockPrep, for the
-    same reason: fitting before splitting lets the validation rows shape the
-    statistics that hyperparameter selection is then read off.
-
-    In `emb` gate mode the gate reads the FROZEN aligned blocks, not the
-    adapted one. The adapted vector changes every step, so a scaler fitted
-    once on it would be stale by the second epoch.
-    """
+    """One inner fold for the adapter rows."""
     E, Zp = Xa[:, :pre_dim], Xa[:, pre_dim + dim:]
     Ze = Xa[:, pre_dim:pre_dim + dim]
     sc = StandardScaler().fit(E[i_tr])
@@ -862,15 +605,7 @@ def _adapter_pack(Xa, M, y, i_tr, i_va, gate_input, pre_dim, dim):
 
 
 def adapter_candidates(mode, wd_adapter_grid, lr_repr=None):
-    """(alpha_or_wd_gate, wd_head, lr) per mode, with the same rho guard.
-
-    only    alpha frozen at 0 -- 12 candidates, since there is no gate and no
-            alpha to search
-    fixed   alpha searched over ADAPTER_ALPHA_GRID; every selected alpha in
-            every run so far has landed in 0.00-0.40, so the grid is targeted
-            rather than uniform on [0,1]
-    learned wd_gate searched, exactly as for E
-    """
+    """(alpha_or_wd_gate, wd_head, lr) per mode, with the same rho guard."""
     out = []
     first = ([0.0] if mode == 'only' else
              ADAPTER_ALPHA_GRID if mode == 'fixed' else WD_GATE_GRID)
@@ -892,12 +627,7 @@ def adapter_candidates(mode, wd_adapter_grid, lr_repr=None):
 
 def run_adapter(Xa, M, y, groups, folds, gate_input, args, mode,
                 use_base=True):
-    """One adapter row: 3-fold inner CV, refit on full outer-train, score test.
-
-    Identical fold logic to run_learned_alpha -- the outer folds, the inner
-    3-fold, the mean-AUROC ranking, the median epoch, the discard-and-refit --
-    so the rows are comparable to each other and to every sklearn row.
-    """
+    """One adapter row: 3-fold inner CV, refit on full outer-train, score test."""
     pre_dim, dim = args.pre_dim, N_COMPONENTS
     rank = args.adapter_rank if use_base else args.mlp_rank
     wd_repr_grid = args.wd_adapter if use_base else args.wd_mlp
