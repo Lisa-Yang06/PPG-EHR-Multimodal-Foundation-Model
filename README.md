@@ -1,7 +1,7 @@
 # 🫀 PPG–EHR: EHR-Guided PPG Representation Learning and Admission-Adaptive Fusion
 
 ## 🔬 Overview
-Photoplethysmography carries fine-grained physiological detail but none of the
+Photoplethysmography carries fine-grained physiological detail but lacks the
 clinical context in an electronic health record. This repository aligns
 PaPaGei-s PPG embeddings with sEHR-BERT clinical-code embeddings by
 bidirectional contrastive learning on MIMIC-III/IV, and evaluates the result on
